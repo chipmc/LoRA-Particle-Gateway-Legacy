@@ -35,6 +35,11 @@
 // v7.00 - Added Signal to Noise Ratio to hourly reporting / webhook, battery level monitoring improvements, added power cycle function - Optimized for stick antenna - new center freq
 // v9.00 - Breaking Change - v10 Node Required - Node Now Reports RSSI / SNR to Gateway, Simplified Join Request Logic, Storing / reporting hops
 // v10.00 - Updated the power management code to encourage charging
+// v11.00 - Updated to deviceOS 6.3.4 and changed time zone to PST
+// v12.00 - Minimal Change- updated to support the Photon2 - So WiFi and Cellular - automatically selectes
+// v13.00 - Fixed carrier-board user button initialization and rolled forward the Photon 2/P2 support changes
+
+
 
 #define DEFAULT_LORA_WINDOW 5
 #define STAY_CONNECTED 60
@@ -52,14 +57,19 @@
 #include "MyPersistentData.h"						// Where my persistent storage files are kept
 
 // Support for Particle Products (changes coming in 4.x - https://docs.particle.io/cards/firmware/macros/product_id/)
-PRODUCT_VERSION(10);									// For now, we are putting nodes and gateways in the same product group - need to deconflict #
-char currentPointRelease[6] ="10.00";
+PRODUCT_VERSION(13);									// For now, we are putting nodes and gateways in the same product group - need to deconflict #
+char currentPointRelease[6] ="13.00";
 
 // Prototype functions
 void publishStateTransition(void);                  // Keeps track of state machine changes - for debugging
 void userSwitchISR();                               // interrupt service routime for the user switch
 void publishWebhook(uint8_t nodeNumber);			// Publish data based on node number
 void softDelay(uint32_t t);                 		// Soft delay is safer than delay
+void syncTimeFormattingToLocalTime();              // Keep Particle Time formatting aligned with LocalTimeRK
+void logBootHeader();                               // Log firmware and platform data at boot for field diagnostics
+void updateMinHeap();                              // Track the lowest free heap during the active cycle
+void logWakeHeap(const char *context);             // Log free heap after startup or wake
+void logPreSleepHeap(unsigned long sleepSeconds);  // Log heap immediately before sleep
 
 // System Health Variables
 int outOfMemory = -1;                               // From reference code provided in AN0023 (see above)
@@ -78,12 +88,20 @@ void outOfMemoryHandler(system_event_t event, int param);
 
 // Program Variables
 volatile bool userSwitchDectected = false;	
+uint32_t heapAtWake = 0;
+uint32_t minHeapThisCycle = 0;
+uint32_t heapBeforeSleep = 0;
+system_tick_t heapCycleStart = 0;
 
 void setup() 
 {
 	waitFor(Serial.isConnected, 10000);				// Wait for serial connection
 
     initializePinModes();                           // Sets the pinModes
+	LocalTime::instance().withConfig(LocalTimePosixTimezone("EST5EDT,M3.2.0/2:00:00,M11.1.0/2:00:00"));			// East coast of the US
+	ab1805.withFOUT(WAKEUP_PIN).setup();        	// Initialize RTC before loading FRAM-backed data that uses Time.now()
+	if (Time.isValid()) syncTimeFormattingToLocalTime();
+	logBootHeader();
 
 	// Load the persistent storage objects
 	sysStatus.setup();
@@ -93,8 +111,6 @@ void setup()
 	takeMeasurements();
 
     Particle_Functions::instance().setup();         // Sets up all the Particle functions and variables defined in particle_fn.h
-                         
-    ab1805.withFOUT(D8).setup();                	// Initialize AB1805 RTC   
     ab1805.setWDT(AB1805::WATCHDOG_MAX_SECONDS);	// Enable watchdog
 
 	System.on(out_of_memory, outOfMemoryHandler);   // Enabling an out of memory handler is a good safety tip. If we run out of memory a System.reset() is done.
@@ -104,14 +120,15 @@ void setup()
 	LoRA_Functions::instance().setup(true);			// Start the LoRA radio (true for Gateway and false for Node)
 
 	// Setup local time and set the publishing schedule
-	LocalTime::instance().withConfig(LocalTimePosixTimezone("EST5EDT,M3.2.0/2:00:00,M11.1.0/2:00:00"));			// East coast of the US
 	conv.withCurrentTime().convert();  				        // Convert to local time for use later
 
-	if (Time.isValid()) {
+	const bool startupNeedsCloudSync = !Time.isValid() || sysStatus.wasReinitializedThisBoot() || current.wasReinitializedThisBoot() || sysStatus.get_lastConnection() == 0;
+
+	if (!startupNeedsCloudSync && Time.isValid()) {
 		Log.info("LocalTime initialized, time is %s and RTC %s set", conv.format("%I:%M:%S%p").c_str(), (ab1805.isRTCSet()) ? "is" : "is not");
 	}
 	else {
-		Log.info("LocalTime not initialized so will need to Connect to Particle");
+		Log.info("Startup requires Particle connection for time or data validation");
 		state = CONNECTING_STATE;
 	}
 
@@ -124,6 +141,7 @@ void setup()
 	attachInterrupt(BUTTON_PIN,userSwitchISR,CHANGE); // We may need to monitor the user switch to change behaviours / modes
 
 	if (state == INITIALIZATION_STATE) state = SLEEPING_STATE;  // This is not a bad way to start - could also go to the LoRA_STATE
+	logWakeHeap("startup");
 	
 }
 
@@ -132,7 +150,12 @@ void loop() {
 	switch (state) {
 		case IDLE_STATE: {
 			if (state != oldState) publishStateTransition();                   // We will apply the back-offs before sending to ERROR state - so if we are here we will take action
-			if (sysStatus.get_alertCodeGateway() != 0) state = ERROR_STATE;
+			if (userSwitchDectected) {
+				userSwitchDectected = false;
+				Log.info("User button pressed - transitioning to CONNECTING_STATE");
+				state = CONNECTING_STATE;
+			}
+			else if (sysStatus.get_alertCodeGateway() != 0) state = ERROR_STATE;
 			else state = LoRA_STATE;											// Go to the LoRA state to start the next cycle									
 		} break;
 
@@ -144,22 +167,28 @@ void loop() {
 			wakeBoundary = (sysStatus.get_frequencyMinutes() * 60UL);
 			wakeInSeconds = constrain(wakeBoundary - Time.now() % wakeBoundary, 0UL, wakeBoundary);  // If Time is valid, we can compute time to the start of the next report window	
 			time = Time.now() + wakeInSeconds;
-			Log.info("Sleep for %lu seconds until next event at %s", wakeInSeconds, Time.format(time, "%T").c_str());
+			conv.withTime(time).convert();
+			Log.info("Sleep for %lu seconds until next local event at %s", wakeInSeconds, conv.format("%T").c_str());
 			config.mode(SystemSleepMode::ULTRA_LOW_POWER)
 				.gpio(BUTTON_PIN,CHANGE)
 				.duration(wakeInSeconds * 1000L);
+			logPreSleepHeap(wakeInSeconds);
 			ab1805.stopWDT();  												   // No watchdogs interrupting our slumber
 			SystemSleepResult result = System.sleep(config);                   // Put the device to sleep device continues operations from here
 			ab1805.resumeWDT();                                                // Wakey Wakey - WDT can resume
+			logWakeHeap((result.wakeupPin() == BUTTON_PIN) ? "wake-button" : "wake-timer");
 			if (result.wakeupPin() == BUTTON_PIN) {
 				waitFor(Serial.isConnected, 10000);							   // Wait for serial connection
 				softDelay(1000);
-				Log.info("Woke with user button");
+				Log.info("Woke with user button - transitioning to CONNECTING_STATE");
+				userSwitchDectected = false;
+				state = CONNECTING_STATE;
 			}
 			else {															   // Awoke for time
-				Log.info("Awoke at %s with %li free memory", Time.format(Time.now(), "%T").c_str(), System.freeMemory());
+				conv.withCurrentTime().convert();
+				Log.info("Awoke at %s %s with %li free memory", conv.format("%T").c_str(), conv.zoneName().c_str(), System.freeMemory());
+				state = IDLE_STATE;
 			}
-			state = IDLE_STATE;
 
 		} break;
 
@@ -205,7 +234,6 @@ void loop() {
 			sysStatus.set_messageCount(sysStatus.get_messageCount() + 1);		// Increment the message counter 
 			state = LoRA_STATE;
 		} break;
-
 		case CONNECTING_STATE: {
 			static system_tick_t connectingTimeout = 0;
 
@@ -224,9 +252,12 @@ void loop() {
 				sysStatus.set_lastConnection(Time.now());
 				sysStatus.set_lastConnectionDuration((millis() - connectingTimeout) / 1000);	// Record connection time in seconds
 				if (Particle.connected()) {
-					Particle.syncTime();												// To prevent large connections, we will sync every hour when we connect to the cellular network.
-					waitUntil(Particle.syncTimeDone);									// Make sure sync is complete
-					CellularSignal sig = Cellular.RSSI();
+					Particle.syncTime();												// To prevent large connections, we will sync every hour when we connect to the Particle cloud.
+					waitUntil(Particle.syncTimeDone);								// Make sure sync is complete
+					syncTimeFormattingToLocalTime();
+					getSignalStrength();
+					updateMinHeap();
+					Log.info("Heap post-cloud: free=%lu min=%lu", (unsigned long)System.freeMemory(), (unsigned long)minHeapThisCycle);
 				}
 				if (sysStatus.get_connectivityMode() == 1) state = LoRA_STATE;			// Go back to the LoRA State if we are in connected mode
 				else state = DISCONNECTING_STATE;	 									// Typically, we will disconnect and sleep to save power - publishes occur during the 90 seconds before disconnect
@@ -279,6 +310,7 @@ void loop() {
 	nodeDatabase.loop();
 
 	LoRA_Functions::instance().loop();				// Check to see if Node connections are healthy
+	updateMinHeap();
 
 	if (outOfMemory >= 0) {                         // In this function we are going to reset the system if there is an out of memory error
 		Log.info("Resetting due to low memory");
@@ -287,6 +319,86 @@ void loop() {
   	}
 
 	if (sysStatus.get_alertCodeGateway() > 0) state = ERROR_STATE;
+}
+
+void syncTimeFormattingToLocalTime() {
+	if (!Time.isValid()) {
+		return;
+	}
+
+	const LocalTimePosixTimezone &timeZoneConfig = LocalTime::instance().getConfig();
+	if (!timeZoneConfig.isValid()) {
+		return;
+	}
+
+	LocalTimeConvert localConv;
+	localConv.withConfig(timeZoneConfig).withCurrentTime().convert();
+
+	Time.zone(-((float)timeZoneConfig.standardHMS.toSeconds()) / 3600.0f);
+	if (timeZoneConfig.hasDST()) {
+		Time.setDSTOffset(((float)(timeZoneConfig.standardHMS.toSeconds() - timeZoneConfig.dstHMS.toSeconds())) / 3600.0f);
+		if (localConv.isDST()) {
+			Time.beginDST();
+		}
+		else {
+			Time.endDST();
+		}
+	}
+	else {
+		Time.setDSTOffset(0);
+		Time.endDST();
+	}
+}
+
+void logBootHeader() {
+	const char *platformName;
+	const char *transportName;
+
+	#if PLATFORM_ID == PLATFORM_BORON
+	platformName = "boron";
+	#elif defined(PLATFORM_PHOTON2) && (PLATFORM_ID == PLATFORM_PHOTON2)
+	platformName = "photon2";
+	#elif defined(PLATFORM_P2) && (PLATFORM_ID == PLATFORM_P2)
+	platformName = "p2";
+	#else
+	platformName = "unknown";
+	#endif
+
+	#if HAL_PLATFORM_CELLULAR
+	transportName = "cellular";
+	#elif HAL_PLATFORM_WIFI
+	transportName = "wifi";
+	#else
+	transportName = "unknown";
+	#endif
+
+	Log.info("========== Boot Header ==========");
+	Log.info("Firmware %s platform=%s transport=%s deviceOS=%s", currentPointRelease, platformName, transportName, System.version().c_str());
+	Log.info("DeviceID=%s resetReason=%d timeValid=%s build=%s %s", System.deviceID().c_str(), (int)System.resetReason(), Time.isValid() ? "yes" : "no", __DATE__, __TIME__);
+}
+
+void updateMinHeap() {
+	uint32_t freeHeap = System.freeMemory();
+	if (minHeapThisCycle == 0 || freeHeap < minHeapThisCycle) {
+		minHeapThisCycle = freeHeap;
+	}
+}
+
+void logWakeHeap(const char *context) {
+	heapAtWake = System.freeMemory();
+	minHeapThisCycle = heapAtWake;
+	heapCycleStart = millis();
+	Log.info("Heap %s: free=%lu", context, (unsigned long)heapAtWake);
+}
+
+void logPreSleepHeap(unsigned long sleepSeconds) {
+	updateMinHeap();
+	heapBeforeSleep = System.freeMemory();
+	Log.info("Heap pre-sleep: free=%lu min=%lu awakeMs=%lu nextSleepS=%lu",
+		(unsigned long)heapBeforeSleep,
+		(unsigned long)minHeapThisCycle,
+		(unsigned long)(millis() - heapCycleStart),
+		sleepSeconds);
 }
 
 /**
@@ -321,11 +433,10 @@ void userSwitchISR() {
  * 
  * 
  */
-
 void publishWebhook(uint8_t nodeNumber) {
 	char data[256];                             						// Store the date in this character array - not global
 	// Battery conect information - https://docs.particle.io/reference/device-os/firmware/boron/#batterystate-
-    const char* batteryContext[8] = {"Unknown","Not Charging","Charging","Charged","Discharging","Fault","Diconnected"};
+	const char* batteryContext[8] = {"Unknown","Not Charging","Charging","Charged","Discharging","Fault","Diconnected"};
 
 	if (!Time.isValid()) return;										// A webhook without a valid timestamp is worthless
 	unsigned long endTimePeriod = Time.now() - (Time.second() + 1);		// Moves the timestamp withing the reporting boundary - so 18:00:14 becomes 17:59:59 - helps in Ubidots reporting

@@ -21,7 +21,11 @@ extern char signalStr[64];
 /**
  * @brief This code collects basic data from the default sensors - TMP-36 (inside temp), battery charge level and signal strength
  * 
- * @details Uses an analog input and the appropriate scaling
+ * @details Uses an analog input and the appropriate scaling.
+ * On Photon 2 and P2 builds in this repository, enclosure temperature sensing
+ * assumes the carrier board physically bridges A4 to A5. Without that bridge,
+ * the TMP36 reading will not be valid and the code intentionally falls back to
+ * a guarded 25C default when readings are out of bounds.
  * 
  * @returns Returns true if succesful and puts the data into the current object
  * 
@@ -31,7 +35,12 @@ bool takeMeasurements();                               // Function that calls th
 /**
  * @brief tmp36TemperatureC
  * 
- * @details generic code that convers the analog value of the TMP-36 sensors to degrees c - Assume 3.3V Power
+ * @details Generic code that converts the analog value of the TMP-36 sensors to
+ * degrees C assuming 3.3V power.
+ * @note Photon 2/P2 temperature support in this project requires a physical
+ * bridge between carrier pins A4 and A5 so the TMP36 signal reaches the
+ * analog-capable input used by this firmware. If the bridge is absent,
+ * invalid readings are clamped by the 25C fallback guard.
  * 
  * @returns Returns the temperature in C as a float value
  * 

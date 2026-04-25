@@ -4,6 +4,7 @@
 
 # Ignore build results and bundles
 *.bin
+*_firmware_*.bin
 *.zip
 [Dd]ebug/
 [Dd]ebugPublic/

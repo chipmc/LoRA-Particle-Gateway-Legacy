@@ -29,6 +29,33 @@ LoRA_Functions::~LoRA_Functions() {
 // JSON for node data
 JsonParserStatic<1024, 50> jp;						// Make this global - reduce possibility of fragmentation
 
+namespace {
+	const unsigned long NODE_HEALTH_WINDOW_SECONDS = 60UL * 60UL;
+
+	void formatNodeHealthLine(char *buffer, size_t bufferSize, int nodeNumber, const String &nodeDeviceID, time_t lastConnect, float successPercent, int pendingAlert) {
+		const bool validLastCheck = (lastConnect > 0) && Time.isValid();
+		const unsigned long secondsSinceLast = (validLastCheck && Time.now() >= lastConnect) ? (unsigned long)(Time.now() - lastConnect) : 0UL;
+		const bool healthy = validLastCheck && (secondsSinceLast <= NODE_HEALTH_WINDOW_SECONDS);
+
+		if (validLastCheck) {
+			snprintf(buffer, bufferSize, "Node%d - ID %s, %s. Last check-in %lu min ago, success %4.2f, pending alert %d",
+				nodeNumber,
+				nodeDeviceID.c_str(),
+				healthy ? "healthy" : "unhealthy",
+				secondsSinceLast / 60UL,
+				successPercent,
+				pendingAlert);
+		}
+		else {
+			snprintf(buffer, bufferSize, "Node%d - ID %s, unhealthy. Last check-in unavailable, success %4.2f, pending alert %d",
+				nodeNumber,
+				nodeDeviceID.c_str(),
+				successPercent,
+				pendingAlert);
+		}
+	}
+}
+
 
 // ************************************************************************
 // *****                      LoRA Setup                              *****
@@ -85,7 +112,10 @@ bool LoRA_Functions::setup(bool gatewayID) {
 	jp.addString(nodeDatabase.get_nodeIDJson());				// Read in the JSON string from memory
 	Log.info("The node string is: %s",nodeDatabase.get_nodeIDJson().c_str());
 
-	if (jp.parse()) Log.info("Parsed Successfully");
+	if (jp.parse()) {
+		Log.info("Parsed Successfully");
+		printNodeData(false);
+	}
 	else {
 		nodeDatabase.resetNodeIDs();
 		Log.info("Parsing error resetting nodeID database");
@@ -126,7 +156,7 @@ bool  LoRA_Functions::initializeRadio() {  			// Set up the Radio Module
 	}
 	driver.setFrequency(RF95_FREQ);					// Frequency is typically 868.0 or 915.0 in the Americas, or 433.0 in the EU - Are there more settings possible here?
 	driver.setTxPower(23, false);                   // If you are using RFM95/96/97/98 modules which uses the PA_BOOST transmitter pin, then you can set transmitter powers from 5 to 23 dBm (13dBm default).  PA_BOOST?
-	driver.setModemConfig(RH_RF95::Bw125Cr45Sf2048);
+	driver.setModemConfig(static_cast<RH_RF95::ModemConfigChoice>(4));
 	//driver.setModemConfig(RH_RF95::Bw125Cr48Sf4096);	// This optimized the radio for long range - https://www.airspayce.com/mikem/arduino/RadioHead/classRH__RF95.html
 	driver.setLowDatarate();						// https://www.airspayce.com/mikem/arduino/RadioHead/classRH__RF95.html#a8e2df6a6d2cb192b13bd572a7005da67
 	manager.setTimeout(2000);						// 200mSec is the default - may need to extend once we play with other settings on the modem - https://www.airspayce.com/mikem/arduino/RadioHead/classRHReliableDatagram.html
@@ -600,7 +630,7 @@ void LoRA_Functions::printNodeData(bool publish) {
 		jp.getValueByKey(nodeObjectContainer, "succ", successPercent);
 		jp.getValueByKey(nodeObjectContainer, "pend", pendingAlert);
 
-		snprintf(data, sizeof(data), "Node %d, deviceID: %s, checksum %d, lastConnected: %s, type %d, success %4.2f with pending alert %d", nodeNumber, nodeDeviceID.c_str(), radioID, Time.timeStr(lastConnect).c_str(), sensorType, successPercent, pendingAlert);
+		formatNodeHealthLine(data, sizeof(data), nodeNumber, nodeDeviceID, (time_t)lastConnect, successPercent, pendingAlert);
 		Log.info(data);
 		if (Particle.connected() && publish) {
 			Particle.publish("nodeData", data, PRIVATE);

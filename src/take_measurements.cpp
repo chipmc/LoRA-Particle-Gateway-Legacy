@@ -7,15 +7,61 @@ const char* batteryContext[7] = {"Unknown","Not Charging","Charging","Charged","
 #include "device_pinout.h"
 #include "MyPersistentData.h"
 
-FuelGauge fuelGauge;                                // Needed to address issue with updates in low battery state 
+#if HAL_PLATFORM_CELLULAR
+FuelGauge fuelGauge;                                // Needed to address issue with updates in low battery state
+#endif
+
+namespace {
+
+uint8_t fallbackInternalTempC() {
+  uint8_t previous = current.get_internalTempC();
+  return (previous > 0 && previous < 80) ? previous : 25;
+}
+
+int readTmp36Raw(pin_t pin) {
+  analogRead(pin);
+  delayMicroseconds(50);
+
+  const int sampleCount = 8;
+  int rawSum = 0;
+  for (int index = 0; index < sampleCount; index++) {
+    rawSum += analogRead(pin);
+    delayMicroseconds(50);
+  }
+
+  return rawSum / sampleCount;
+}
+
+uint8_t readInternalTempC() {
+  int raw = readTmp36Raw(TMP36_SENSE_PIN);
+
+  bool sensorOk = (raw > 50 && raw < 4000);
+  float tempC = tmp36TemperatureC(raw);
+
+  if (!sensorOk || tempC < 0.0f || tempC > 80.0f) {
+    uint8_t fallback = fallbackInternalTempC();
+    Log.warn("TMP36 reading invalid or out of range (tmp36=%.2f C, raw=%d, sensorOk=%s) - falling back to %uC",
+        (double)tempC, raw, sensorOk ? "true" : "false", fallback);
+    return fallback;
+  }
+
+  Log.info("TMP36 valid temp %.2fC (raw=%d) - using for battery charging limits",
+      (double)tempC, raw);
+
+  return (uint8_t)(tempC + 0.5f);
+}
+
+}
 
 bool takeMeasurements() { 
 
-  fuelGauge.quickStart();                           // Start the fuel gauge
-  softDelay(1000);                                  // Give the fuel gauge time to start
+  #if HAL_PLATFORM_CELLULAR
+    fuelGauge.quickStart();                         // Start the fuel gauge
+    softDelay(1000);                                // Give the fuel gauge time to start
+  #endif
 
   // Temperature inside the enclosure
-  current.set_internalTempC((int)tmp36TemperatureC(analogRead(TMP36_SENSE_PIN)));
+  current.set_internalTempC(readInternalTempC());
 
   batteryState();
 
@@ -53,61 +99,103 @@ float tmp36TemperatureC (int adcValue) {
 
 
 bool batteryState() {
-  current.set_stateOfCharge(System.batteryCharge());                   // Assign to system value
-  if (current.get_stateOfCharge() > 60) return true;
-  else return false;
+  #if PLATFORM_ID == PLATFORM_BORON
+    current.set_stateOfCharge(System.batteryCharge());                 // Assign to system value
+    if (current.get_stateOfCharge() > 60) return true;
+    else return false;
+  #elif PLATFORM_ID == 32 || PLATFORM_ID == 34
+    // Photon 2 / P2 do not expose Boron fuel-gauge APIs. Estimate SoC from VBAT.
+    int raw = analogRead(A6);
+    float voltage = raw / 819.2f;
+    double stateOfCharge = (voltage - 3.0f) * (100.0f / (4.2f - 3.0f));
+
+    if (stateOfCharge < 0.0f) {
+      stateOfCharge = 0.0f;
+    }
+    else if (stateOfCharge > 100.0f) {
+      stateOfCharge = 100.0f;
+    }
+
+    current.set_stateOfCharge(stateOfCharge);
+    current.set_batteryState(0);                                       // Unknown without PMIC/fuel gauge
+    Log.info("Battery: voltage=%.2fV, state=%s (%d), SoC=%.2f%% (estimated from voltage)",
+        (double)voltage, batteryContext[current.get_batteryState()], current.get_batteryState(), stateOfCharge);
+
+    if (current.get_stateOfCharge() > 60) return true;
+    else return false;
+  #else
+    current.set_stateOfCharge(0);
+    current.set_batteryState(0);
+    return true;
+  #endif
 }
 
 
 bool isItSafeToCharge()                             // Returns a true or false if the battery is in a safe charging range.
 {
-  // current.set_internalTempC(40);                  // This is a test value for the temperature
-  bool returnVal = false;
+  #if PLATFORM_ID == PLATFORM_BORON
+    // current.set_internalTempC(40);                  // This is a test value for the temperature
+    bool returnVal = false;
 
-  if (current.get_internalTempC() < 0 || current.get_internalTempC() > 37 )  {  // Reference: (32 to 113 but with safety)
+    if (current.get_internalTempC() < 0 || current.get_internalTempC() > 37 )  {  // Reference: (32 to 113 but with safety)
 
-    if (!initializePowerCfg(false)) {               // Disable charging if the temperature is outside of the safe range
-      current.set_batteryState(1);                    // Overwrites the values from the batteryState API to reflect that we are "Not Charging"
-      Log.info("Charging disabled - temp is %iC",current.get_internalTempC() );
-      returnVal = true;
-    }
-    else  {
-      Log.error("Unable to disable charging");
-      current.set_batteryState(0);                    // Unknown battery state
-    }
+      if (!initializePowerCfg(false)) {               // Disable charging if the temperature is outside of the safe range
+        current.set_batteryState(1);                  // Overwrites the values from the batteryState API to reflect that we are "Not Charging"
+        Log.info("Charging disabled - temp is %iC",current.get_internalTempC() );
+        returnVal = true;
+      }
+      else  {
+        Log.error("Unable to disable charging");
+        current.set_batteryState(0);                  // Unknown battery state
+      }
 
-  }
-  else {
-    if (!initializePowerCfg(true)) {                                      // Enable charging if the temperature is within the safe range
-      current.set_batteryState(System.batteryState());                      // Call before isItSafeToCharge() as it may overwrite the context
-      Log.info("Charging enabled - inside temp range");
-      returnVal = true;
     }
-    else  {
-      current.set_batteryState(0);                    // Unknown battery state
-      Log.error("Unable to enable charging");
+    else {
+      if (!initializePowerCfg(true)) {                // Enable charging if the temperature is within the safe range
+        current.set_batteryState(System.batteryState());
+        Log.info("Charging enabled - inside temp range");
+        returnVal = true;
+      }
+      else  {
+        current.set_batteryState(0);                  // Unknown battery state
+        Log.error("Unable to enable charging");
+      }
     }
-  }
-  return returnVal;
+    return returnVal;
+  #else
+    bool safe = current.get_internalTempC() >= 0 && current.get_internalTempC() <= 37;
+    current.set_batteryState(0);
+    if (!safe) {
+      Log.warn("Charging temperature out of range on non-PMIC platform: %iC", current.get_internalTempC());
+    }
+    return true;
+  #endif
 }
 
 
 void getSignalStrength() {
-  char signalStr[16];
-  const char* radioTech[10] = {"Unknown","None","WiFi","GSM","UMTS","CDMA","LTE","IEEE802154","LTE_CAT_M1","LTE_CAT_NB1"};
-  // New Signal Strength capability - https://community.particle.io/t/boron-lte-and-cellular-rssi-funny-values/45299/8
-  CellularSignal sig = Cellular.RSSI();
+  char signalStr[32];
+  #if HAL_PLATFORM_CELLULAR
+    const char* radioTech[10] = {"Unknown","None","WiFi","GSM","UMTS","CDMA","LTE","IEEE802154","LTE_CAT_M1","LTE_CAT_NB1"};
+    CellularSignal sig = Cellular.RSSI();
+    auto rat = sig.getAccessTechnology();
+    float strengthPercentage = sig.getStrength();
+    float qualityPercentage = sig.getQuality();
 
-  auto rat = sig.getAccessTechnology();
+    if (strengthPercentage < 0 || qualityPercentage < 0) return;
 
-  //float strengthVal = sig.getStrengthValue();
-  float strengthPercentage = sig.getStrength();
+    snprintf(signalStr, sizeof(signalStr), "%s S:%2.0f%%, Q:%2.0f%% ", radioTech[rat], strengthPercentage, qualityPercentage);
+    Log.info(signalStr);
+  #elif HAL_PLATFORM_WIFI
+    WiFiSignal sig = WiFi.RSSI();
+    float strengthPercentage = sig.getStrength();
+    float qualityPercentage = sig.getQuality();
 
-  //float qualityVal = sig.getQualityValue();
-  float qualityPercentage = sig.getQuality();
+    if (strengthPercentage < 0 || qualityPercentage < 0) return;
 
-  snprintf(signalStr,sizeof(signalStr), "%s S:%2.0f%%, Q:%2.0f%% ", radioTech[rat], strengthPercentage, qualityPercentage);
-  Log.info(signalStr);
+    snprintf(signalStr, sizeof(signalStr), "WiFi S:%2.0f%%, Q:%2.0f%% ", strengthPercentage, qualityPercentage);
+    Log.info(signalStr);
+  #endif
 }
 
 

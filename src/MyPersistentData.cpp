@@ -29,6 +29,7 @@ sysStatusData::~sysStatusData() {
 
 void sysStatusData::setup() {
     fram.begin();
+    reinitializedThisBoot = false;
     sysStatus
     //    .withLogData(true)
         .withSaveDelayMs(500)
@@ -39,6 +40,10 @@ void sysStatusData::setup() {
 
 void sysStatusData::loop() {
     sysStatus.flush(false);
+}
+
+bool sysStatusData::wasReinitializedThisBoot() const {
+    return reinitializedThisBoot;
 }
 
 bool sysStatusData::validate(size_t dataSize) {
@@ -64,6 +69,7 @@ bool sysStatusData::validate(size_t dataSize) {
 
 void sysStatusData::initialize() {
     PersistentDataFRAM::initialize();
+    reinitializedThisBoot = true;
 
     Log.info("data initialized");
 
@@ -248,6 +254,7 @@ currentStatusData::~currentStatusData() {
 
 void currentStatusData::setup() {
     fram.begin();
+    reinitializedThisBoot = false;
 
     current
     //    .withLogData(true)
@@ -259,6 +266,10 @@ void currentStatusData::setup() {
 
 void currentStatusData::loop() {
     current.flush(false);
+}
+
+bool currentStatusData::wasReinitializedThisBoot() const {
+    return reinitializedThisBoot;
 }
 
 bool currentStatusData::validate(size_t dataSize) {
@@ -275,6 +286,7 @@ bool currentStatusData::validate(size_t dataSize) {
 
 void currentStatusData::initialize() {
     PersistentDataFRAM::initialize();
+    reinitializedThisBoot = true;
 
     Log.info("Current Data Initialized");
 
@@ -286,7 +298,7 @@ void currentStatusData::initialize() {
 
 
 void currentStatusData::resetEverything() {                             // The device is waking up in a new day or is a new install
-  Log.info("A new day - resetting everything");
+    Log.info("Resetting current data defaults");
   current.set_nodeNumber(11);
   current.set_tempNodeNumber(0);
   current.set_nodeID(0);

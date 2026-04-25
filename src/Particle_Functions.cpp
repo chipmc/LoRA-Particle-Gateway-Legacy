@@ -86,6 +86,7 @@ int Particle_Functions::jsonFunctionParser(String command) {
 		if (function == "reset") {
       // Format - function - reset, node - nodeNumber, variables - either "current", "all" or "nodeData"
       // Test - {"cmd":[{"node":1,"var":"all","fn":"reset"}]}
+      // Reset Node Data - {"cmd":[{"node":0,"var":"nodeData","fn":"reset"}]}
       if (nodeNumber == 0) {
         if (variable == "nodeData") {
           snprintf(messaging,sizeof(messaging),"Resetting the gateway's node Data");
@@ -248,18 +249,30 @@ bool Particle_Functions::disconnectFromParticle()                      // Ensure
     return(false);
   }
   else Log.info("Disconnected from Particle in %i seconds", (int)(Time.now() - startTime));
-  // Then we need to disconnect from Cellular and power down the cellular modem
   startTime = Time.now();
-  Cellular.disconnect();                                               // Disconnect from the cellular network
-  Cellular.off();                                                      // Turn off the cellular modem
-  waitFor(Cellular.isOff, 30000);                                      // As per TAN004: https://support.particle.io/hc/en-us/articles/1260802113569-TAN004-Power-off-Recommendations-for-SARA-R410M-Equipped-Devices
-  Particle.process();
-  if (Cellular.isOn()) {                                               // At this point, if cellular is not off, we have a problem
-    Log.info("Failed to turn off the Cellular modem");
-    return(false);                                                     // Let the calling function know that we were not able to turn off the cellular modem
-  }
-  else {
+  #if HAL_PLATFORM_CELLULAR
+    Cellular.disconnect();                                             // Disconnect from the cellular network
+    Cellular.off();                                                    // Turn off the cellular modem
+    waitFor(Cellular.isOff, 30000);                                    // As per TAN004: https://support.particle.io/hc/en-us/articles/1260802113569-TAN004-Power-off-Recommendations-for-SARA-R410M-Equipped-Devices
+    Particle.process();
+    if (Cellular.isOn()) {                                             // At this point, if cellular is not off, we have a problem
+      Log.info("Failed to turn off the cellular modem");
+      return(false);
+    }
     Log.info("Turned off the cellular modem in %i seconds", (int)(Time.now() - startTime));
     return true;
-  }
+  #elif HAL_PLATFORM_WIFI
+    WiFi.disconnect();
+    WiFi.off();
+    waitFor(WiFi.isOff, 30000);
+    Particle.process();
+    if (WiFi.isOn()) {
+      Log.info("Failed to turn off WiFi");
+      return(false);
+    }
+    Log.info("Turned off WiFi in %i seconds", (int)(Time.now() - startTime));
+    return true;
+  #else
+    return true;
+  #endif
 }

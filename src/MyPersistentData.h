@@ -50,6 +50,11 @@ public:
     void loop();
 
 	/**
+	 * @brief Returns true if this storage object was reinitialized during setup.
+	 */
+	bool wasReinitializedThisBoot() const;
+
+	/**
 	 * @brief Validates values and, if valid, checks that data is in the correct range.
 	 * 
 	 */
@@ -206,6 +211,7 @@ protected:
     //Since these variables are only used internally - They can be private. 
 	static const uint32_t SYS_DATA_MAGIC = 0x20a99e76;
 	static const uint16_t SYS_DATA_VERSION = 1;
+	bool reinitializedThisBoot = false;
 
 };
 
@@ -239,6 +245,11 @@ public:
      * You typically use MyPersistentData::instance().loop();
      */
     void loop();
+
+	/**
+	 * @brief Returns true if this storage object was reinitialized during setup.
+	 */
+	bool wasReinitializedThisBoot() const;
 
 	/**
 	 * @brief Load the appropriate system defaults - good ot initialize a system to "factory settings"
@@ -424,6 +435,7 @@ protected:
     //Since these variables are only used internally - They can be private. 
 	static const uint32_t CURRENT_DATA_MAGIC = 0x20a99e80;
 	static const uint16_t CURRENT_DATA_VERSION = 3;
+	bool reinitializedThisBoot = false;
 };
 
 
