@@ -514,8 +514,21 @@ bool nodeIDData::validate(size_t dataSize) {
 void nodeIDData::initialize() {
 
     Log.info("Erasing FRAM region");
-    for (unsigned int i=0; i < sizeof(NodeData); i++) {
-        fram.writeData(i+200,(uint8_t *)0xFF,2);
+        const uint8_t erasedBlock[16] = {
+            0xFF, 0xFF, 0xFF, 0xFF,
+            0xFF, 0xFF, 0xFF, 0xFF,
+            0xFF, 0xFF, 0xFF, 0xFF,
+            0xFF, 0xFF, 0xFF, 0xFF
+        };
+        for (size_t offset = 0; offset < sizeof(NodeData); offset += sizeof(erasedBlock)) {
+            size_t blockLen = sizeof(erasedBlock);
+            if ((offset + blockLen) > sizeof(NodeData)) {
+                blockLen = sizeof(NodeData) - offset;
+            }
+            if (!fram.writeData(offset + 200, erasedBlock, blockLen)) {
+                Log.error("Failed to erase FRAM region at offset=%u", (unsigned)(offset + 200));
+                return;
+            }
     }
 
     Log.info("Initializing data");

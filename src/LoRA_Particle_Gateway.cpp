@@ -52,8 +52,8 @@
 #include "MyPersistentData.h"						// Where my persistent storage files are kept
 
 // Support for Particle Products (changes coming in 4.x - https://docs.particle.io/cards/firmware/macros/product_id/)
-PRODUCT_VERSION(10);									// For now, we are putting nodes and gateways in the same product group - need to deconflict #
-char currentPointRelease[6] ="10.00";
+PRODUCT_VERSION(17);									// For now, we are putting nodes and gateways in the same product group - need to deconflict #
+char currentPointRelease[6] ="17.00";
 
 // Prototype functions
 void publishStateTransition(void);                  // Keeps track of state machine changes - for debugging
