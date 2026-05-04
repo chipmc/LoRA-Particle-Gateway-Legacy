@@ -6,6 +6,7 @@ const char* batteryContext[7] = {"Unknown","Not Charging","Charging","Charged","
 #include "take_measurements.h"
 #include "device_pinout.h"
 #include "MyPersistentData.h"
+#include "power_management.h"
 
 #if HAL_PLATFORM_CELLULAR
 FuelGauge fuelGauge;                                // Needed to address issue with updates in low battery state
@@ -51,6 +52,41 @@ uint8_t readInternalTempC() {
   return (uint8_t)(tempC + 0.5f);
 }
 
+float readBatteryVoltage() {
+#if HAL_PLATFORM_CELLULAR
+  return fuelGauge.getVCell();
+#elif PLATFORM_ID == 32 || PLATFORM_ID == 34
+  int raw = analogRead(A6);
+  return raw / 819.2f;
+#else
+  return 0.0f;
+#endif
+}
+
+bool hasExternalPowerSource() {
+#if HAL_PLATFORM_POWER_MANAGEMENT && HAL_PLATFORM_PMIC_BQ24195
+  PMIC pmic;
+  return pmic.isPowerGood();
+#else
+  return false;
+#endif
+}
+
+void updatePowerManagementFromObservation() {
+  PowerObservation obs = {};
+  int batteryStateCode = current.get_batteryState();
+
+  obs.batterySoc = current.get_stateOfCharge();
+  obs.batteryVoltage = readBatteryVoltage();
+  obs.temperatureF = (current.get_internalTempC() * 9.0f / 5.0f) + 32.0f;
+  obs.inputPowerPresent = hasExternalPowerSource();
+  obs.batteryIsCharging = batteryStateCode == 2;
+  obs.batteryNotCharging = batteryStateCode == 1;
+  obs.batteryFault = batteryStateCode == 5;
+
+  updatePowerManagementObservation(obs);
+}
+
 }
 
 bool takeMeasurements() { 
@@ -64,16 +100,22 @@ bool takeMeasurements() {
   current.set_internalTempC(readInternalTempC());
 
   batteryState();
+  updatePowerManagementFromObservation();
 
-  if (isItSafeToCharge()) {
-    Log.info("Battery State: %s, SOC: %2.0f%%",batteryContext[current.get_batteryState()],current.get_stateOfCharge());
-  }
-  else Log.error("Power configuration error");
+  Log.info("Battery State: %s, SOC: %2.0f%%",batteryContext[current.get_batteryState()],current.get_stateOfCharge());
 
   if (sysStatus.get_nodeNumber() == 0 ) getSignalStrength();
 
   return 1;
 
+}
+
+float getBatteryVoltageForDiagnostics() {
+  return readBatteryVoltage();
+}
+
+bool getExternalPowerPresentForDiagnostics() {
+  return hasExternalPowerSource();
 }
 
 
@@ -101,12 +143,12 @@ float tmp36TemperatureC (int adcValue) {
 bool batteryState() {
   #if PLATFORM_ID == PLATFORM_BORON
     current.set_stateOfCharge(System.batteryCharge());                 // Assign to system value
+    current.set_batteryState(System.batteryState());
     if (current.get_stateOfCharge() > 60) return true;
     else return false;
   #elif PLATFORM_ID == 32 || PLATFORM_ID == 34
     // Photon 2 / P2 do not expose Boron fuel-gauge APIs. Estimate SoC from VBAT.
-    int raw = analogRead(A6);
-    float voltage = raw / 819.2f;
+    float voltage = readBatteryVoltage();
     double stateOfCharge = (voltage - 3.0f) * (100.0f / (4.2f - 3.0f));
 
     if (stateOfCharge < 0.0f) {
@@ -118,56 +160,12 @@ bool batteryState() {
 
     current.set_stateOfCharge(stateOfCharge);
     current.set_batteryState(0);                                       // Unknown without PMIC/fuel gauge
-    Log.info("Battery: voltage=%.2fV, state=%s (%d), SoC=%.2f%% (estimated from voltage)",
-        (double)voltage, batteryContext[current.get_batteryState()], current.get_batteryState(), stateOfCharge);
 
     if (current.get_stateOfCharge() > 60) return true;
     else return false;
   #else
     current.set_stateOfCharge(0);
     current.set_batteryState(0);
-    return true;
-  #endif
-}
-
-
-bool isItSafeToCharge()                             // Returns a true or false if the battery is in a safe charging range.
-{
-  #if PLATFORM_ID == PLATFORM_BORON
-    // current.set_internalTempC(40);                  // This is a test value for the temperature
-    bool returnVal = false;
-
-    if (current.get_internalTempC() < 0 || current.get_internalTempC() > 37 )  {  // Reference: (32 to 113 but with safety)
-
-      if (!initializePowerCfg(false)) {               // Disable charging if the temperature is outside of the safe range
-        current.set_batteryState(1);                  // Overwrites the values from the batteryState API to reflect that we are "Not Charging"
-        Log.info("Charging disabled - temp is %iC",current.get_internalTempC() );
-        returnVal = true;
-      }
-      else  {
-        Log.error("Unable to disable charging");
-        current.set_batteryState(0);                  // Unknown battery state
-      }
-
-    }
-    else {
-      if (!initializePowerCfg(true)) {                // Enable charging if the temperature is within the safe range
-        current.set_batteryState(System.batteryState());
-        Log.info("Charging enabled - inside temp range");
-        returnVal = true;
-      }
-      else  {
-        current.set_batteryState(0);                  // Unknown battery state
-        Log.error("Unable to enable charging");
-      }
-    }
-    return returnVal;
-  #else
-    bool safe = current.get_internalTempC() >= 0 && current.get_internalTempC() <= 37;
-    current.set_batteryState(0);
-    if (!safe) {
-      Log.warn("Charging temperature out of range on non-PMIC platform: %iC", current.get_internalTempC());
-    }
     return true;
   #endif
 }

@@ -848,6 +848,18 @@ public:
     /// \param none
     /// \return uint8_t deviceID
     uint8_t getDeviceVersion();
+
+    /// Returns the raw value of a radio register for diagnostics.
+    uint8_t readRegister(uint8_t reg);
+
+    /// Returns the current cached driver mode for diagnostics.
+    RHMode mode() const;
+
+    /// Returns whether a validated RX buffer is pending.
+    bool rxBufferValid() const;
+
+    /// Polls pending RX IRQ state and processes it using the normal receive path.
+    bool processPendingRx();
     
 protected:
     /// This is a low level function to handle the interrupts for one instance of RH_RF95.
@@ -914,6 +926,9 @@ private:
 
     /// device ID
     uint8_t		_deviceVersion = 0x00;
+
+    /// Number of times the interrupt handler has run for this instance.
+    volatile uint32_t    _interruptServiceCount = 0;
     
 };
 

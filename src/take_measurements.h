@@ -22,6 +22,10 @@ extern char signalStr[64];
  * @brief This code collects basic data from the default sensors - TMP-36 (inside temp), battery charge level and signal strength
  * 
  * @details Uses an analog input and the appropriate scaling.
+ * Feeds the reusable power-management module with one raw observation per
+ * measurement cycle so the application can keep remediation timing separate
+ * from measurement collection.
+ *
  * On Photon 2 and P2 builds in this repository, enclosure temperature sensing
  * assumes the carrier board physically bridges A4 to A5. Without that bridge,
  * the TMP36 reading will not be valid and the code intentionally falls back to
@@ -57,16 +61,8 @@ float tmp36TemperatureC (int adcValue);                // Temperature from the t
  * @return false - Less than 60% indicates a low battery condition
  */
 bool batteryState();                                   // Data on state of charge and battery status. Returns true if SOC over 60%
-
-/**
- * @brief Checks to see if the temperature is in the range to support charging
- * 
- * @details Will enable or disable charging based on the current temperature
- * 
- * @link https://batteryuniversity.com/learn/article/charging_at_high_and_low_temperatures @endlink
- * 
- */
-bool isItSafeToCharge();                               // See if it is safe to charge based on the temperature
+float getBatteryVoltageForDiagnostics();               // Current battery voltage when this platform exposes it
+bool getExternalPowerPresentForDiagnostics();          // External/input power presence when this platform exposes it
 
 /**
  * @brief Get the Signal Strength values and make up a string for use in the console

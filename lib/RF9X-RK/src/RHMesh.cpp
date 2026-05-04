@@ -13,6 +13,14 @@
 
 #include <RHMesh.h>
 
+#if __has_include("config.h")
+#include "config.h"
+#endif
+
+#ifndef FIELD_DEBUG_BUILD
+#define FIELD_DEBUG_BUILD 0
+#endif
+
 uint8_t RHMesh::_tmpMessage[RH_ROUTER_MAX_MESSAGE_LEN];
 
 ////////////////////////////////////////////////////////////////////
@@ -167,6 +175,15 @@ bool RHMesh::recvfromAck(uint8_t* buf, uint8_t* len, uint8_t* source, uint8_t* d
 	if (   tmpMessageLen >= 1 
 	    && p->msgType == RH_MESH_MESSAGE_TYPE_APPLICATION)
 	{
+			#if FIELD_DEBUG_BUILD
+			Log.info("RHMesh application packet: source=%u dest=%u id=%u flags=0x%02x hops=%u len=%u",
+				_source,
+				_dest,
+				_id,
+				_flags,
+				_hops,
+				tmpMessageLen);
+			#endif
 	    MeshApplicationMessage* a = (MeshApplicationMessage*)p;
 	    // Handle application layer messages, presumably for our caller
 	    if (source) *source = _source;
@@ -186,18 +203,31 @@ bool RHMesh::recvfromAck(uint8_t* buf, uint8_t* len, uint8_t* source, uint8_t* d
 		 && p->msgType == RH_MESH_MESSAGE_TYPE_ROUTE_DISCOVERY_REQUEST)
 	{
 	    MeshRouteDiscoveryMessage* d = (MeshRouteDiscoveryMessage*)p;
+	    #if FIELD_DEBUG_BUILD
+	    Log.info("RHMesh route discovery request: source=%u via=%u looking-for=%u this=%u hops=%u len=%u",
+		_source,
+		headerFrom(),
+		d->dest,
+		_thisAddress,
+		_hops,
+		tmpMessageLen);
+	    #endif
 	    // Handle Route discovery requests
 	    // Message is an array of node addresses the route request has already passed through
 	    // If it originally came from us, ignore it
-	    if (_source == _thisAddress)
+	    if (_source == _thisAddress) {
+		Log.info("RHMesh route discovery ignored: source-is-self=%u", _source);
 		return false;
+	    }
 	    
 	    uint8_t numRoutes = tmpMessageLen - sizeof(MeshMessageHeader) - 2;
 	    uint8_t i;
 	    // Are we already mentioned?
 	    for (i = 0; i < numRoutes; i++)
-		if (d->route[i] == _thisAddress)
+		if (d->route[i] == _thisAddress) {
+		    Log.info("RHMesh route discovery ignored: already-visited this=%u source=%u", _thisAddress, _source);
 		    return false; // Already been through us. Discard
+		}
 	    
 	        
             addRouteTo(_source, headerFrom()); // The originator needs to be added regardless of node type
@@ -215,12 +245,28 @@ bool RHMesh::recvfromAck(uint8_t* buf, uint8_t* len, uint8_t* source, uint8_t* d
 		// This route discovery is for us. Unicast the whole route back to the originator
 		// as a RH_MESH_MESSAGE_TYPE_ROUTE_DISCOVERY_RESPONSE
 		// We are certain to have a route there, because we just got it
+		Log.info("RHMesh route discovery response: source=%u dest=%u this=%u via=%u",
+		    _source,
+		    d->dest,
+		    _thisAddress,
+		    headerFrom());
 		d->header.msgType = RH_MESH_MESSAGE_TYPE_ROUTE_DISCOVERY_RESPONSE;
-		RHRouter::sendtoWait((uint8_t*)d, tmpMessageLen, _source);
+		const uint8_t routeResponseResult = RHRouter::sendtoWait((uint8_t*)d, tmpMessageLen, _source);
+		Log.info("RHMesh route discovery response result: to-origin=%u sought=%u this=%u via=%u result=%u continuing-listen=1",
+		    _source,
+		    d->dest,
+		    _thisAddress,
+		    headerFrom(),
+		    routeResponseResult);
 	    }
 	    else if ((i < _max_hops) && _isa_router)
 	    {
 		// Its for someone else, rebroadcast it, after adding ourselves to the list
+		Log.info("RHMesh route discovery rebroadcast: source=%u target=%u this=%u numRoutes=%u",
+		    _source,
+		    d->dest,
+		    _thisAddress,
+		    numRoutes);
 		d->route[numRoutes] = _thisAddress;
 		tmpMessageLen++;
 		// Have to impersonate the source

@@ -13,6 +13,14 @@
 
 #include <RHRouter.h>
 
+#if __has_include("config.h")
+#include "config.h"
+#endif
+
+#ifndef FIELD_DEBUG_BUILD
+#define FIELD_DEBUG_BUILD 0
+#endif
+
 RHRouter::RoutedMessage RHRouter::_tmpMessage;
 
 ////////////////////////////////////////////////////////////////////
@@ -115,13 +123,7 @@ void RHRouter::printRoutingTable()
     uint8_t i;
     for (i = 0; i < RH_ROUTING_TABLE_SIZE; i++)
     {
-	Serial.print(i, DEC);
-	Serial.print(" Dest: ");
-	Serial.print(_routes[i].dest, DEC);
-	Serial.print(" Next Hop: ");
-	Serial.print(_routes[i].next_hop, DEC);
-	Serial.print(" State: ");
-	Serial.println(_routes[i].state, DEC);
+	Log.info("%u Dest: %u Next Hop: %u State: %u", i, _routes[i].dest, _routes[i].next_hop, _routes[i].state);
     }
 #endif
 }
@@ -285,6 +287,16 @@ bool RHRouter::recvfromAck(uint8_t* buf, uint8_t* len, uint8_t* source, uint8_t*
 	// See if its for us or has to be routed
 	if (_tmpMessage.header.dest == _thisAddress || _tmpMessage.header.dest == RH_BROADCAST_ADDRESS)
 	{
+	    #if FIELD_DEBUG_BUILD
+	    Log.info("RHRouter deliver local: source=%u dest=%u id=%u flags=0x%02x hops=%u len=%u this=%u",
+		_tmpMessage.header.source,
+		_tmpMessage.header.dest,
+		_tmpMessage.header.id,
+		_tmpMessage.header.flags,
+		_tmpMessage.header.hops,
+		tmpMessageLen,
+		_thisAddress);
+	    #endif
 	    // Deliver it here
 	    if (source) *source  = _tmpMessage.header.source;
 	    if (dest)   *dest    = _tmpMessage.header.dest;
@@ -305,8 +317,31 @@ bool RHRouter::recvfromAck(uint8_t* buf, uint8_t* len, uint8_t* source, uint8_t*
 	    // tell the originator. BUT HOW?
 	    
 	    // If we are forwarding packets, do so. Otherwise, drop.
-	    if (_isa_router)
+	    if (_isa_router) {
+		Log.info("RHRouter forward attempt: source=%u dest=%u id=%u hops=%u len=%u this=%u",
+		    _tmpMessage.header.source,
+		    _tmpMessage.header.dest,
+		    _tmpMessage.header.id,
+		    _tmpMessage.header.hops,
+		    tmpMessageLen,
+		    _thisAddress);
 	        route(&_tmpMessage, tmpMessageLen);
+	    }
+	    else {
+		Log.info("RHRouter drop: source=%u dest=%u reason=not-router this=%u",
+		    _tmpMessage.header.source,
+		    _tmpMessage.header.dest,
+		    _thisAddress);
+	    }
+	}
+	else if (_tmpMessage.header.dest != RH_BROADCAST_ADDRESS)
+	{
+	    Log.info("RHRouter drop: source=%u dest=%u reason=max-hops hops=%u max=%u this=%u",
+		_tmpMessage.header.source,
+		_tmpMessage.header.dest,
+		_tmpMessage.header.hops,
+		_max_hops,
+		_thisAddress);
 	}
 	// Discard it and maybe wait for another
     }
