@@ -35,9 +35,12 @@
 // v7.00 - Added Signal to Noise Ratio to hourly reporting / webhook, battery level monitoring improvements, added power cycle function - Optimized for stick antenna - new center freq
 // v9.00 - Breaking Change - v10 Node Required - Node Now Reports RSSI / SNR to Gateway, Simplified Join Request Logic, Storing / reporting hops
 // v10.00 - Updated the power management code to encourage charging
+// v19.00 - Dual-platform Boron/Photon 2 gateway release with platform abstraction, closed-hours scheduling, P2 pin mapping, and connection diagnostics
 
 #define DEFAULT_LORA_WINDOW 5
 #define STAY_CONNECTED 60
+#define PARTICLE_SYNC_TIMEOUT_MS 45000UL
+#define DISCONNECTING_HARD_TIMEOUT_MS 180000UL
 
 // Particle Libraries
 #include "PublishQueuePosixRK.h"			        // https://github.com/rickkas7/PublishQueuePosixRK
@@ -45,6 +48,7 @@
 #include "AB1805_RK.h"                          	// Watchdog and Real Time Clock - https://github.com/rickkas7/AB1805_RK
 #include "Particle.h"                               // Because it is a CPP file not INO
 // Application Files
+#include "GatewayPlatform.h"
 #include "LoRA_Functions.h"							// Where we store all the information on our LoRA implementation - application specific not a general library
 #include "device_pinout.h"							// Define pinouts and initialize them
 #include "Particle_Functions.h"							// Particle specific functions
@@ -52,14 +56,18 @@
 #include "MyPersistentData.h"						// Where my persistent storage files are kept
 
 // Support for Particle Products (changes coming in 4.x - https://docs.particle.io/cards/firmware/macros/product_id/)
-PRODUCT_VERSION(17);									// For now, we are putting nodes and gateways in the same product group - need to deconflict #
-char currentPointRelease[6] ="17.00";
+PRODUCT_VERSION(GATEWAY_PRODUCT_VERSION);								// Platform-specific gateway release number
+char currentPointRelease[6] = GATEWAY_RELEASE_STRING;
 
 // Prototype functions
 void publishStateTransition(void);                  // Keeps track of state machine changes - for debugging
 void userSwitchISR();                               // interrupt service routime for the user switch
 void publishWebhook(uint8_t nodeNumber);			// Publish data based on node number
 void softDelay(uint32_t t);                 		// Soft delay is safer than delay
+void serviceBackgroundTasksDuringWait(void);
+bool waitForParticleSyncWithHousekeeping(uint32_t timeoutMs);
+bool isParkOpenNow(void);
+unsigned long nextWakeIntervalSeconds(void);
 
 // System Health Variables
 int outOfMemory = -1;                               // From reference code provided in AN0023 (see above)
@@ -82,8 +90,10 @@ volatile bool userSwitchDectected = false;
 void setup() 
 {
 	waitFor(Serial.isConnected, 10000);				// Wait for serial connection
+	logGatewayBootHeader();
 
     initializePinModes();                           // Sets the pinModes
+	LoRA_Functions::instance().logGatewayDio0Setup("pre-lora-setup");
 
 	// Load the persistent storage objects
 	sysStatus.setup();
@@ -102,6 +112,8 @@ void setup()
 	PublishQueuePosix::instance().setup();          // Initialize PublishQueuePosixRK
 
 	LoRA_Functions::instance().setup(true);			// Start the LoRA radio (true for Gateway and false for Node)
+	LoRA_Functions::instance().attachGatewayDio0DiagnosticInterrupt();
+	LoRA_Functions::instance().logGatewayDio0Setup("post-lora-setup");
 
 	// Setup local time and set the publishing schedule
 	LocalTime::instance().withConfig(LocalTimePosixTimezone("EST5EDT,M3.2.0/2:00:00,M11.1.0/2:00:00"));			// East coast of the US
@@ -132,17 +144,19 @@ void loop() {
 	switch (state) {
 		case IDLE_STATE: {
 			if (state != oldState) publishStateTransition();                   // We will apply the back-offs before sending to ERROR state - so if we are here we will take action
+			current.set_openHours(isParkOpenNow());
 			if (sysStatus.get_alertCodeGateway() != 0) state = ERROR_STATE;
+			else if (!current.get_openHours()) state = SLEEPING_STATE;
 			else state = LoRA_STATE;											// Go to the LoRA state to start the next cycle									
 		} break;
 
 		case SLEEPING_STATE: {
-			unsigned long wakeInSeconds, wakeBoundary;
+			unsigned long wakeInSeconds;
 			time_t time;
 
 			publishStateTransition();                   					// We will apply the back-offs before sending to ERROR state - so if we are here we will take action
-			wakeBoundary = (sysStatus.get_frequencyMinutes() * 60UL);
-			wakeInSeconds = constrain(wakeBoundary - Time.now() % wakeBoundary, 0UL, wakeBoundary);  // If Time is valid, we can compute time to the start of the next report window	
+			current.set_openHours(isParkOpenNow());
+			wakeInSeconds = nextWakeIntervalSeconds();
 			time = Time.now() + wakeInSeconds;
 			Log.info("Sleep for %lu seconds until next event at %s", wakeInSeconds, Time.format(time, "%T").c_str());
 			config.mode(SystemSleepMode::ULTRA_LOW_POWER)
@@ -166,19 +180,27 @@ void loop() {
 		case LoRA_STATE: {														// Enter this state every reporting period and stay here for 5 minutes
 			static system_tick_t startLoRAWindow = 0;
 			static byte connectionWindow = 0;
+			static system_tick_t lastLoRaDiagnosticLog = 0;
 
 			if (state != oldState) {
 				if (oldState != REPORTING_STATE) startLoRAWindow = millis();    // Mark when we enter this state - for timeouts - but multiple messages won't keep us here forever
+				lastLoRaDiagnosticLog = 0;
 				publishStateTransition();                   					// We will apply the back-offs before sending to ERROR state - so if we are here we will take action
 				conv.withCurrentTime().convert();								// Get the time and convert to Local
-				if (conv.getLocalTimeHMS().hour >= sysStatus.get_openTime() && conv.getLocalTimeHMS().hour <= sysStatus.get_closeTime()) current.set_openHours(true);
-				else current.set_openHours(false);
+				current.set_openHours(isParkOpenNow());
 
 				if (sysStatus.get_connectivityMode() == 0) connectionWindow = DEFAULT_LORA_WINDOW;
 				else connectionWindow = STAY_CONNECTED;
 
+				LoRA_Functions::instance().logGatewayStateEntry();
+
 				Log.info("Gateway is listening for %d minutes for LoRA messages and the park is %s (%d / %d / %d)", (sysStatus.get_connectivityMode() == 0) ? DEFAULT_LORA_WINDOW : 60, (current.get_openHours()) ? "open":"closed", conv.getLocalTimeHMS().hour, sysStatus.get_openTime(), sysStatus.get_closeTime());
 			} 
+
+			if ((millis() - lastLoRaDiagnosticLog) >= 15000UL) {
+				lastLoRaDiagnosticLog = millis();
+				LoRA_Functions::instance().logGatewayDio0Snapshot();
+			}
 
 			if (LoRA_Functions::instance().listenForLoRAMessageGateway()) {
 				if (current.get_alertCodeNode() != 1 && current.get_openHours()) {				// We don't report Join alerts or after hours
@@ -208,6 +230,11 @@ void loop() {
 
 		case CONNECTING_STATE: {
 			static system_tick_t connectingTimeout = 0;
+#if HAL_PLATFORM_WIFI
+			static system_tick_t connectStartedMs = 0;
+			static system_tick_t wifiConnectedMs = 0;
+			static system_tick_t cloudConnectedMs = 0;
+#endif
 
 			if (state != oldState) {
 				publishStateTransition();  
@@ -216,22 +243,62 @@ void loop() {
 					Log.info("New Day - Resetting everything");
 				}
 				publishWebhook(sysStatus.get_nodeNumber());								// Before we connect - let's send the gateway's webhook
-				if (!Particle.connected()) Particle.connect();							// Time to connect to Particle
+				if (!isCloudConnected()) startNetworkConnect();						// Time to connect to the active network transport
 				connectingTimeout = millis();
+#if HAL_PLATFORM_WIFI
+				connectStartedMs = connectingTimeout;
+				wifiConnectedMs = 0;
+				cloudConnectedMs = 0;
+#endif
 			}
 
-			if (Particle.connected()) {													// Either we will connect or we will timeout - will try for 10 minutes 
+#if HAL_PLATFORM_WIFI
+			if (wifiConnectedMs == 0 && isNetworkReady()) {
+				wifiConnectedMs = millis();
+				SYSTEM_VERBOSE_LOG("Connect metrics detail: wifi_ready after %lu ms", (unsigned long)(wifiConnectedMs - connectStartedMs));
+			}
+#endif
+
+			if (isCloudConnected()) {											// Either we will connect or we will timeout - will try for 10 minutes 
+				#if HAL_PLATFORM_WIFI
+				if (cloudConnectedMs == 0) {
+					cloudConnectedMs = millis();
+				}
+				#endif
 				sysStatus.set_lastConnection(Time.now());
 				sysStatus.set_lastConnectionDuration((millis() - connectingTimeout) / 1000);	// Record connection time in seconds
-				if (Particle.connected()) {
+				if (isCloudConnected()) {
 					Particle.syncTime();												// To prevent large connections, we will sync every hour when we connect to the cellular network.
-					waitUntil(Particle.syncTimeDone);									// Make sure sync is complete
-					CellularSignal sig = Cellular.RSSI();
+					if (!waitForParticleSyncWithHousekeeping(PARTICLE_SYNC_TIMEOUT_MS)) {
+						Log.error("Particle time sync timed out after %lu ms - continuing without fresh sync", PARTICLE_SYNC_TIMEOUT_MS);
+					}
+					#if HAL_PLATFORM_WIFI
+					int strength = 0;
+					int quality = 0;
+					getGatewaySignalMetrics(strength, quality);
+					const unsigned long wifiSeconds = (wifiConnectedMs > connectStartedMs) ? ((wifiConnectedMs - connectStartedMs) / 1000UL) : 0UL;
+					const unsigned long cloudSeconds = (cloudConnectedMs > wifiConnectedMs && wifiConnectedMs != 0) ? ((cloudConnectedMs - wifiConnectedMs) / 1000UL) : 0UL;
+					const unsigned long totalSeconds = (cloudConnectedMs > connectStartedMs) ? ((cloudConnectedMs - connectStartedMs) / 1000UL) : 0UL;
+					Log.info("Connect metrics: wifi=%lus cloud=%lus total=%lus rssi=%d quality=%d", wifiSeconds, cloudSeconds, totalSeconds, strength, quality);
+					SYSTEM_VERBOSE_LOG("Connect metrics detail: start=%lu wifi=%lu cloud=%lu", (unsigned long)connectStartedMs, (unsigned long)wifiConnectedMs, (unsigned long)cloudConnectedMs);
+					#else
+					logSignalStrength();
+					#endif
 				}
 				if (sysStatus.get_connectivityMode() == 1) state = LoRA_STATE;			// Go back to the LoRA State if we are in connected mode
 				else state = DISCONNECTING_STATE;	 									// Typically, we will disconnect and sleep to save power - publishes occur during the 90 seconds before disconnect
 			}
 			else if (millis() - connectingTimeout > 600000L) {
+				#if HAL_PLATFORM_WIFI
+				const unsigned long totalSeconds = (millis() - connectStartedMs) / 1000UL;
+				if (wifiConnectedMs == 0) {
+					Log.info("Connect metrics: wifi_failed after %lus", totalSeconds);
+				}
+				else {
+					const unsigned long wifiSeconds = (wifiConnectedMs - connectStartedMs) / 1000UL;
+					Log.info("Connect metrics: cloud_failed wifi=%lus total=%lus", wifiSeconds, totalSeconds);
+				}
+				#endif
 				Log.info("Failed to connect in 10 minutes - giving up");
 				sysStatus.set_connectivityMode(0);										// Setting back to zero - must not have coverage here or here at this time
 				state = DISCONNECTING_STATE;											// Makes sure we turn off the radio
@@ -241,23 +308,39 @@ void loop() {
 
 		case DISCONNECTING_STATE: {														// Waits 90 seconds then disconnects
 			static system_tick_t stayConnectedWindow = 0;
+			static system_tick_t disconnectHardTimeout = 0;
 
 			if (state != oldState) {
 				publishStateTransition(); 
 				stayConnectedWindow = millis(); 
+				disconnectHardTimeout = millis();
 			}
 
 			if ((millis() - stayConnectedWindow > 90000UL) && PublishQueuePosix::instance().getCanSleep()) {	// Stay on-line for 90 seconds and until we are done clearing the queue
 				if (sysStatus.get_connectivityMode() == 0) Particle_Functions::instance().disconnectFromParticle();
 				state = SLEEPING_STATE;
 			}
+			else if ((millis() - disconnectHardTimeout) > DISCONNECTING_HARD_TIMEOUT_MS) {
+				const size_t queuedEvents = PublishQueuePosix::instance().getNumEvents();
+				Log.error("Disconnect timeout after %lu ms waiting on publish queue (canSleep=%s queued=%u) - forcing cloud shutdown", DISCONNECTING_HARD_TIMEOUT_MS, PublishQueuePosix::instance().getCanSleep() ? "yes" : "no", (unsigned) queuedEvents);
+				if (Particle_Functions::instance().disconnectFromParticle()) {
+					state = SLEEPING_STATE;
+				}
+				else {
+					Log.error("Forced disconnect failed after disconnect timeout - entering error recovery");
+					sysStatus.set_alertCodeGateway(1);
+					sysStatus.set_alertTimestampGateway(Time.now());
+					state = ERROR_STATE;
+				}
+			}
 		} break;
 
 		case ERROR_STATE: {
-			static system_tick_t resetTimeout = millis();
+			static system_tick_t resetTimeout = 0;
 
 			if (state != oldState) {
 				publishStateTransition();
+				resetTimeout = millis();
 				if (Particle.connected()) Particle.publish("Alert","Deep power down in 30 seconds", PRIVATE);
 				sysStatus.set_alertCodeGateway(0);			// Reset this
 			}
@@ -324,8 +407,6 @@ void userSwitchISR() {
 
 void publishWebhook(uint8_t nodeNumber) {
 	char data[256];                             						// Store the date in this character array - not global
-	// Battery conect information - https://docs.particle.io/reference/device-os/firmware/boron/#batterystate-
-    const char* batteryContext[8] = {"Unknown","Not Charging","Charging","Charged","Discharging","Fault","Diconnected"};
 
 	if (!Time.isValid()) return;										// A webhook without a valid timestamp is worthless
 	unsigned long endTimePeriod = Time.now() - (Time.second() + 1);		// Moves the timestamp withing the reporting boundary - so 18:00:14 becomes 17:59:59 - helps in Ubidots reporting
@@ -337,7 +418,7 @@ void publishWebhook(uint8_t nodeNumber) {
 		float percentSuccess = ((current.get_successCount() * 1.0)/ current.get_messageCount())*100.0;
 
 		snprintf(data, sizeof(data), "{\"deviceid\":\"%s\", \"hourly\":%u, \"daily\":%u, \"sensortype\":%d, \"battery\":%4.2f,\"key1\":\"%s\",\"temp\":%d, \"resets\":%d,\"alerts\": %d, \"node\": %d, \"rssi\":%d,  \"snr\":%d, \"hops\":%d, \"msg\":%d, \"success\":%4.2f, \"timestamp\":%lu000}",\
-		deviceID.c_str(), current.get_hourlyCount(), current.get_dailyCount(), current.get_sensorType(), current.get_stateOfCharge(), batteryContext[current.get_batteryState()],\
+		deviceID.c_str(), current.get_hourlyCount(), current.get_dailyCount(), current.get_sensorType(), current.get_stateOfCharge(), gatewayBatteryContext(current.get_batteryState()),\
 		current.get_internalTempC(), current.get_resetCount(), current.get_alertCodeNode(), current.get_nodeNumber(), current.get_RSSI(), current.get_SNR(), current.get_hops(), current.get_messageCount(), percentSuccess, endTimePeriod);
 		PublishQueuePosix::instance().publish("Ubidots-LoRA-Node-v1", data, PRIVATE | WITH_ACK);
 	}
@@ -345,7 +426,7 @@ void publishWebhook(uint8_t nodeNumber) {
 		takeMeasurements();												// Loads the current values for the Gateway
 
 		snprintf(data, sizeof(data), "{\"deviceid\":\"%s\", \"hourly\":%u, \"daily\":%u, \"sensortype\":%d, \"battery\":%4.2f,\"key1\":\"%s\",\"temp\":%d, \"resets\":%d, \"msg\":%d, \"timestamp\":%lu000}",\
-		Particle.deviceID().c_str(), 0, 0, sysStatus.get_sensorType(), current.get_stateOfCharge(), batteryContext[current.get_batteryState()],\
+		Particle.deviceID().c_str(), 0, 0, sysStatus.get_sensorType(), current.get_stateOfCharge(), gatewayBatteryContext(current.get_batteryState()),\
 		current.get_internalTempC(), sysStatus.get_resetCount(), sysStatus.get_messageCount(), endTimePeriod);
 		PublishQueuePosix::instance().publish("Ubidots-LoRA-Gateway-v1", data, PRIVATE | WITH_ACK);
 	}
@@ -360,4 +441,57 @@ void publishWebhook(uint8_t nodeNumber) {
  */
 inline void softDelay(uint32_t t) {
   for (uint32_t ms = millis(); millis() - ms < t; Particle.process());  //  safer than a delay()
+}
+
+bool isParkOpenNow(void) {
+	conv.withCurrentTime().convert();
+	const int currentHour = conv.getLocalTimeHMS().hour;
+	return (currentHour >= sysStatus.get_openTime() && currentHour <= sysStatus.get_closeTime());
+}
+
+unsigned long nextWakeIntervalSeconds(void) {
+	const unsigned long wakeBoundary = (sysStatus.get_frequencyMinutes() * 60UL);
+	const unsigned long nextBoundary = constrain(wakeBoundary - (Time.now() % wakeBoundary), 0UL, wakeBoundary);
+	time_t nextBoundaryTime = Time.now() + nextBoundary;
+	LocalTimeConvert nextWakeConv(conv);
+	nextWakeConv.withTime(nextBoundaryTime).convert();
+	const int nextWakeHour = nextWakeConv.getLocalTimeHMS().hour;
+	const bool nextBoundaryIsOpen = (nextWakeHour >= sysStatus.get_openTime() && nextWakeHour <= sysStatus.get_closeTime());
+
+	if (current.get_openHours() && nextBoundaryIsOpen) {
+		return nextBoundary;
+	}
+
+	const int currentHour = conv.getLocalTimeHMS().hour;
+	int hoursUntilOpen = (int)sysStatus.get_openTime() - currentHour;
+	if (hoursUntilOpen <= 0) {
+		hoursUntilOpen += 24;
+	}
+
+	const unsigned long secondsUntilOpen = (unsigned long)hoursUntilOpen * 3600UL
+		- ((unsigned long)conv.getLocalTimeHMS().minute * 60UL)
+		- (unsigned long)conv.getLocalTimeHMS().second;
+
+	return max(1UL, secondsUntilOpen);
+}
+
+void serviceBackgroundTasksDuringWait(void) {
+	Particle.process();
+	ab1805.loop();
+	PublishQueuePosix::instance().loop();
+	sysStatus.loop();
+	current.loop();
+	nodeDatabase.loop();
+	LoRA_Functions::instance().loop();
+}
+
+bool waitForParticleSyncWithHousekeeping(uint32_t timeoutMs) {
+	const system_tick_t start = millis();
+	while (!Particle.syncTimeDone()) {
+		serviceBackgroundTasksDuringWait();
+		if ((millis() - start) >= timeoutMs) {
+			return false;
+		}
+	}
+	return true;
 }

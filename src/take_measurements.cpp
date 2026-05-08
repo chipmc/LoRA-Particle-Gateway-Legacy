@@ -1,18 +1,16 @@
-// Battery conect information - https://docs.particle.io/reference/device-os/firmware/boron/#batterystate-
-const char* batteryContext[7] = {"Unknown","Not Charging","Charging","Charged","Discharging","Fault","Diconnected"};
-
 //Particle Functions
 #include "Particle.h"
 #include "take_measurements.h"
 #include "device_pinout.h"
 #include "MyPersistentData.h"
-
-FuelGauge fuelGauge;                                // Needed to address issue with updates in low battery state 
+#include "GatewayPlatform.h"
 
 bool takeMeasurements() { 
 
-  fuelGauge.quickStart();                           // Start the fuel gauge
-  softDelay(1000);                                  // Give the fuel gauge time to start
+  platformPrepareBatteryMeasurement();
+  if (platformBatterySupported()) {
+    softDelay(1000);                                // Give the fuel gauge time to start
+  }
 
   // Temperature inside the enclosure
   current.set_internalTempC((int)tmp36TemperatureC(analogRead(TMP36_SENSE_PIN)));
@@ -20,11 +18,15 @@ bool takeMeasurements() {
   batteryState();
 
   if (isItSafeToCharge()) {
-    Log.info("Battery State: %s, SOC: %2.0f%%",batteryContext[current.get_batteryState()],current.get_stateOfCharge());
+    if (platformBatterySupported()) {
+      SYSTEM_VERBOSE_LOG("Battery State: %s, SOC: %2.0f%%", gatewayBatteryContext(current.get_batteryState()), current.get_stateOfCharge());
+    }
   }
-  else Log.error("Power configuration error");
+  else if (platformBatterySupported()) {
+    Log.error("Power configuration error");
+  }
 
-  if (sysStatus.get_nodeNumber() == 0 ) getSignalStrength();
+  if (sysStatus.get_nodeNumber() == 0 ) logSignalStrength();
 
   return 1;
 
@@ -53,61 +55,13 @@ float tmp36TemperatureC (int adcValue) {
 
 
 bool batteryState() {
-  current.set_stateOfCharge(System.batteryCharge());                   // Assign to system value
-  if (current.get_stateOfCharge() > 60) return true;
-  else return false;
+  return platformReadBatteryState();
 }
 
 
 bool isItSafeToCharge()                             // Returns a true or false if the battery is in a safe charging range.
 {
-  // current.set_internalTempC(40);                  // This is a test value for the temperature
-  bool returnVal = false;
-
-  if (current.get_internalTempC() < 0 || current.get_internalTempC() > 37 )  {  // Reference: (32 to 113 but with safety)
-
-    if (!initializePowerCfg(false)) {               // Disable charging if the temperature is outside of the safe range
-      current.set_batteryState(1);                    // Overwrites the values from the batteryState API to reflect that we are "Not Charging"
-      Log.info("Charging disabled - temp is %iC",current.get_internalTempC() );
-      returnVal = true;
-    }
-    else  {
-      Log.error("Unable to disable charging");
-      current.set_batteryState(0);                    // Unknown battery state
-    }
-
-  }
-  else {
-    if (!initializePowerCfg(true)) {                                      // Enable charging if the temperature is within the safe range
-      current.set_batteryState(System.batteryState());                      // Call before isItSafeToCharge() as it may overwrite the context
-      Log.info("Charging enabled - inside temp range");
-      returnVal = true;
-    }
-    else  {
-      current.set_batteryState(0);                    // Unknown battery state
-      Log.error("Unable to enable charging");
-    }
-  }
-  return returnVal;
-}
-
-
-void getSignalStrength() {
-  char signalStr[16];
-  const char* radioTech[10] = {"Unknown","None","WiFi","GSM","UMTS","CDMA","LTE","IEEE802154","LTE_CAT_M1","LTE_CAT_NB1"};
-  // New Signal Strength capability - https://community.particle.io/t/boron-lte-and-cellular-rssi-funny-values/45299/8
-  CellularSignal sig = Cellular.RSSI();
-
-  auto rat = sig.getAccessTechnology();
-
-  //float strengthVal = sig.getStrengthValue();
-  float strengthPercentage = sig.getStrength();
-
-  //float qualityVal = sig.getQualityValue();
-  float qualityPercentage = sig.getQuality();
-
-  snprintf(signalStr,sizeof(signalStr), "%s S:%2.0f%%, Q:%2.0f%% ", radioTech[rat], strengthPercentage, qualityPercentage);
-  Log.info(signalStr);
+  return platformApplyChargePolicy(current.get_internalTempC());
 }
 
 
