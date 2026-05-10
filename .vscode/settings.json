@@ -4,6 +4,6 @@
     "files.associations": {
         "*.ino": "cpp"
     },
-    "particle.targetPlatform": "boron",
-    "particle.targetDevice": "e00fce68f94e5d9875bc13ef"
+    "particle.targetPlatform": "p2",
+    "particle.firmwareVersion": "6.4.0"
 }

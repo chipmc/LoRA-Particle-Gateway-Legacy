@@ -1,5 +1,19 @@
 #include "AB1805_RK.h"
+#include "LocalTimeRK.h"
 
+namespace {
+
+String formatTimeForLog(time_t time) {
+    if (LocalTime::instance().getConfig().isValid()) {
+        LocalTimeConvert conv;
+        conv.withTime(time).convert();
+        return conv.format(TIME_FORMAT_DEFAULT);
+    }
+
+    return Time.format(time, TIME_FORMAT_DEFAULT);
+}
+
+}
 
 
 static Logger _log("app.ab1805");
@@ -37,7 +51,7 @@ void AB1805::setup(bool callBegin) {
             getRtcAsTime(time);
             Time.setTime(time);
 
-            _log.info("set system clock from RTC %s", Time.format(time, TIME_FORMAT_DEFAULT).c_str());
+            _log.info("set system clock from RTC %s", formatTimeForLog(time).c_str());
         }
     }
     else {
@@ -56,7 +70,7 @@ void AB1805::loop() {
 
         time = 0;
         getRtcAsTime(time);
-        _log.info("set RTC from cloud %s", Time.format(time, TIME_FORMAT_DEFAULT).c_str());
+        _log.info("set RTC from cloud %s", formatTimeForLog(time).c_str());
 
     }
 
@@ -205,7 +219,7 @@ bool AB1805::updateWakeReason() {
 
 bool AB1805::setWDT(int seconds) {
     bool bResult = false;
-    _log.info("setWDT %d", seconds);
+    _log.trace("setWDT %d", seconds);
 
     if (seconds < 0) {
         seconds = watchdogSecs;
