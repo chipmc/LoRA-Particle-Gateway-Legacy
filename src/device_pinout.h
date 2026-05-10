@@ -14,6 +14,12 @@
 
 #include "Particle.h"
 
+#if (defined(PLATFORM_P2) && (PLATFORM_ID == PLATFORM_P2)) || (defined(PLATFORM_PHOTON2) && (PLATFORM_ID == PLATFORM_PHOTON2))
+#define MUON_IS_P2_FAMILY 1
+#else
+#define MUON_IS_P2_FAMILY 0
+#endif
+
 // Pin definitions (changed from example code)
 extern const pin_t RFM95_CS;                     // SPI Chip select pin - Standard SPI pins otherwise
 extern const pin_t RFM95_RST;                     // Radio module reset

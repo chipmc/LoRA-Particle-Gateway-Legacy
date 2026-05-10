@@ -1,6 +1,7 @@
 #include "Particle.h"
 #include "MB85RC256V-FRAM-RK.h"
 #include "StorageHelperRK.h"
+#include "GatewayPlatform.h"
 #include "MyPersistentData.h"
 
 
@@ -94,6 +95,7 @@ void sysStatusData::initialize() {
 
     // If you manually update fields here, be sure to update the hash
     updateHash();
+    flush(true);
 }
 
 uint8_t sysStatusData::get_nodeNumber() const {
@@ -294,6 +296,7 @@ void currentStatusData::initialize() {
 
     // If you manually update fields here, be sure to update the hash
     updateHash();
+    flush(true);
 }
 
 
@@ -477,6 +480,26 @@ void currentStatusData::set_productVersion(uint16_t value) {
 //
 // ******************** Offset of 200         **********************
 
+namespace {
+
+const char *const EMPTY_NODE_DB_JSON = "{\"nodes\":[]}";
+
+bool bufferIsFilledWith(const uint8_t *buffer, size_t length, uint8_t value) {
+    for (size_t index = 0; index < length; index++) {
+        if (buffer[index] != value) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool nodeDbRegionLooksBlank(const nodeIDData::NodeData &data) {
+    const uint8_t *bytes = reinterpret_cast<const uint8_t *>(&data);
+    return bufferIsFilledWith(bytes, sizeof(nodeIDData::NodeData), 0xFF) || bufferIsFilledWith(bytes, sizeof(nodeIDData::NodeData), 0x00);
+}
+
+}
+
 nodeIDData *nodeIDData::_instance;
 
 // [static]
@@ -505,44 +528,164 @@ void nodeIDData::setup() {
     // Log.info("sizeof(NodeData): %u", sizeof(NodeData)); 
 }
 
+bool nodeIDData::load() {
+    WITH_LOCK(*this) {
+        NodeData primaryData;
+        memset(&primaryData, 0, sizeof(primaryData));
+        const bool primaryReadOk = fram.readData(NODEID_PRIMARY_OFFSET, (uint8_t *)&primaryData.nodeHeader, sizeof(NodeData));
+
+        memcpy(&nodeData, &primaryData, sizeof(nodeData));
+        if (primaryReadOk && validate(nodeData.nodeHeader.size)) {
+            return true;
+        }
+
+        NodeData backupData;
+        memset(&backupData, 0, sizeof(backupData));
+        const bool backupReadOk = fram.readData(NODEID_BACKUP_OFFSET, (uint8_t *)&backupData.nodeHeader, sizeof(NodeData));
+
+        memcpy(&nodeData, &backupData, sizeof(nodeData));
+        if (backupReadOk && validate(nodeData.nodeHeader.size)) {
+            Log.warn("NodeDB restored from FRAM backup");
+            if (!fram.writeData(NODEID_PRIMARY_OFFSET, (const uint8_t *)&nodeData.nodeHeader, sizeof(NodeData))) {
+                Log.error("NodeDB restore failed to rewrite FRAM primary copy");
+                sysStatus.set_alertCodeGateway(1);
+                sysStatus.flush(true);
+            }
+            return true;
+        }
+
+        if (!primaryReadOk || !backupReadOk) {
+            Log.error("NodeDB FRAM read failed: primary=%s backup=%s", primaryReadOk ? "ok" : "failed", backupReadOk ? "ok" : "failed");
+        }
+
+        if (primaryReadOk && backupReadOk && nodeDbRegionLooksBlank(primaryData) && nodeDbRegionLooksBlank(backupData)) {
+            Log.info("FRAM first boot detected");
+        }
+
+        initialize();
+    }
+
+    return true;
+}
+
+void nodeIDData::save() {
+    WITH_LOCK(*this) {
+        const bool backupOk = fram.writeData(NODEID_BACKUP_OFFSET, (const uint8_t *)&nodeData.nodeHeader, sizeof(NodeData));
+        const bool primaryOk = fram.writeData(NODEID_PRIMARY_OFFSET, (const uint8_t *)&nodeData.nodeHeader, sizeof(NodeData));
+
+        if (!backupOk || !primaryOk) {
+            Log.error("NodeDB save failed: primary=%s backup=%s", primaryOk ? "ok" : "failed", backupOk ? "ok" : "failed");
+        }
+    }
+    PersistentDataBase::save();
+}
+
 void nodeIDData::loop() {
     nodeDatabase.flush(false);
 }
 
-void nodeIDData::resetNodeIDs() {
-    String blank = "{\"nodes\":[]}";
-    Log.info("Resettig NodeID config to: %s", blank.c_str());
-    nodeDatabase.set_nodeIDJson(blank);
-    nodeDatabase.flush(true);
-    Log.info("NodeID data is now %s", nodeDatabase.get_nodeIDJson().c_str());
+bool nodeIDData::resetNodeIDs() {
+    const bool saved = saveNodeIDJson(EMPTY_NODE_DB_JSON, true);
+    if (saved) {
+        Log.info("NodeDB reset to empty database");
+    }
+    return saved;
 }
 
 bool nodeIDData::validate(size_t dataSize) {
     bool valid = PersistentDataFRAM::validate(dataSize);
-    if (!valid) Log.info("nodeID data is %s",(valid) ? "valid": "not valid");
+    if (!valid) {
+        SYSTEM_VERBOSE_LOG("NodeDB FRAM contents failed validation");
+    }
     return valid;
 }
 
 void nodeIDData::initialize() {
-
-    Log.info("Erasing FRAM region");
-    for (unsigned int i=0; i < sizeof(NodeData); i++) {
-        fram.writeData(i+200,(uint8_t *)0xFF,2);
+    Log.info("NodeDB invalid; repairing empty database");
+    PersistentDataFRAM::initialize();
+    if (!saveNodeIDJson(EMPTY_NODE_DB_JSON, true)) {
+        Log.error("NodeDB repair failed while writing empty database");
+        sysStatus.set_alertCodeGateway(1);
+        sysStatus.flush(true);
+        return;
     }
 
-    Log.info("Initializing data");
-    PersistentDataFRAM::initialize();
-    nodeIDData::resetNodeIDs();
-    updateHash();                                       // If you manually update fields here, be sure to update the hash
+    NodeData primaryVerify;
+    NodeData backupVerify;
+    memset(&primaryVerify, 0, sizeof(primaryVerify));
+    memset(&backupVerify, 0, sizeof(backupVerify));
+
+    const bool primaryReadOk = fram.readData(NODEID_PRIMARY_OFFSET, (uint8_t *)&primaryVerify.nodeHeader, sizeof(NodeData));
+    const bool backupReadOk = fram.readData(NODEID_BACKUP_OFFSET, (uint8_t *)&backupVerify.nodeHeader, sizeof(NodeData));
+
+    bool primaryValid = false;
+    bool backupValid = false;
+
+    if (primaryReadOk) {
+        memcpy(&nodeData, &primaryVerify, sizeof(nodeData));
+        primaryValid = validate(nodeData.nodeHeader.size);
+    }
+    if (backupReadOk) {
+        memcpy(&nodeData, &backupVerify, sizeof(nodeData));
+        backupValid = validate(nodeData.nodeHeader.size);
+    }
+
+    if (!primaryReadOk || !backupReadOk || !primaryValid || !backupValid) {
+        Log.error("NodeDB repair verification failed: primaryRead=%s primaryValid=%s backupRead=%s backupValid=%s", primaryReadOk ? "ok" : "failed", primaryValid ? "ok" : "failed", backupReadOk ? "ok" : "failed", backupValid ? "ok" : "failed");
+        sysStatus.set_alertCodeGateway(1);
+        sysStatus.flush(true);
+        return;
+    }
+
+    memcpy(&nodeData, &primaryVerify, sizeof(nodeData));
+    Log.info("NodeDB repair written and verified");
+    Log.info("FRAM init complete");
 }
 
 
 String nodeIDData::get_nodeIDJson() const {
-	String result;
-	getValueString(offsetof(NodeData, nodeIDJson), sizeof(NodeData::nodeIDJson), result);
-	return result;
+    char buffer[sizeof(NodeData::nodeIDJson) + 1];
+    size_t length = 0;
+    WITH_LOCK(*this) {
+        length = strnlen(nodeData.nodeIDJson, sizeof(nodeData.nodeIDJson));
+        memcpy(buffer, nodeData.nodeIDJson, length);
+    }
+    buffer[length] = 0;
+    return String(buffer);
+}
+
+size_t nodeIDData::get_nodeIDJsonLength() const {
+    size_t length = 0;
+    WITH_LOCK(*this) {
+        length = strnlen(nodeData.nodeIDJson, sizeof(nodeData.nodeIDJson));
+    }
+    return length;
 }
 
 bool nodeIDData::set_nodeIDJson(const char *str) {
 	return setValueString(offsetof(NodeData, nodeIDJson), sizeof(NodeData::nodeIDJson), str);
+}
+
+bool nodeIDData::saveNodeIDJson(const char *str, bool force) {
+    if (!str) {
+        Log.error("NodeDB save rejected: null JSON pointer");
+        return false;
+    }
+
+    const size_t jsonLength = strlen(str);
+    if (jsonLength >= sizeof(NodeData::nodeIDJson)) {
+        Log.error("NodeDB save rejected: len=%u max=%u", (unsigned)jsonLength, (unsigned)(sizeof(NodeData::nodeIDJson) - 1));
+        return false;
+    }
+
+    if (!set_nodeIDJson(str)) {
+        Log.error("NodeDB save rejected: len=%u", (unsigned)jsonLength);
+        return false;
+    }
+
+    flush(force);
+    if (force) {
+        Log.info("NodeDB atomic save complete");
+    }
+    return true;
 }
