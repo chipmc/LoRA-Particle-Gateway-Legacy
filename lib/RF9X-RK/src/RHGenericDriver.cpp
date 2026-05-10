@@ -181,25 +181,19 @@ bool  RHGenericDriver::sleep()
 void RHGenericDriver::printBuffer(const char* prompt, const uint8_t* buf, uint8_t len)
 {
 #ifdef RH_HAVE_SERIAL
-    Log.info("%s", prompt);
-    char line[16 * 3 + 1];
-    size_t pos = 0;
-    line[0] = '\0';
-
-    for (uint8_t i = 0; i < len; i++)
+    Serial.println(prompt);
+    uint8_t i;
+    for (i = 0; i < len; i++)
     {
-    int written = snprintf(&line[pos], sizeof(line) - pos, (pos == 0) ? "%02X" : " %02X", buf[i]);
-    if (written < 0) {
-        break;
+	if (i % 16 == 15)
+	    Serial.println(buf[i], HEX);
+	else
+	{
+	    Serial.print(buf[i], HEX);
+	    Serial.print(' ');
+	}
     }
-    pos += (size_t)written;
-
-    if ((i % 16 == 15) || (i + 1 == len)) {
-        Log.info("%s", line);
-        pos = 0;
-        line[0] = '\0';
-    }
-    }
+    Serial.println("");
 #endif
 }
 

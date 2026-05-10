@@ -111,11 +111,6 @@ public:
     void sleepLoRaRadio();
 
     /**
-     * @brief Wake the LoRa radio and ensure RX mode is active.
-     */
-    void wakeLoRaRadio();
-
-    /**
      * @brief Initialize the LoRA radio
      * 
      */

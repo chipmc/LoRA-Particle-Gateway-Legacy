@@ -40,10 +40,7 @@ void Particle_Functions::setup() {
 
 
 void Particle_Functions::loop() {
-  if (pendingNodeDataReport) {
-    pendingNodeDataReport = false;
-    LoRA_Functions::instance().printNodeData(true);
-  }
+    // Put your code to run during the application thread loop here
 }
 
 int Particle_Functions::jsonFunctionParser(String command) {
@@ -153,8 +150,8 @@ int Particle_Functions::jsonFunctionParser(String command) {
     else if (function == "rpt") {
       // Format - function - rpt, node - 0, variables - NA
       // Test - {"cmd":[{"node":0,"var":" ","fn":"rpt"}]}
-      snprintf(messaging,sizeof(messaging),"Queued nodeID Data report");
-      pendingNodeDataReport = true;
+      snprintf(messaging,sizeof(messaging),"Printing nodeID Data");
+      LoRA_Functions::instance().printNodeData(true);
     }
     // Setting Open and close hours
     else if (function == "open") {

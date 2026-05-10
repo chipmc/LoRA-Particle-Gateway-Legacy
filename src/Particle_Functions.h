@@ -94,7 +94,5 @@ protected:
      */
     static Particle_Functions *_instance;
 
-    bool pendingNodeDataReport = false;
-
 };
 #endif  /* __PARTICLE_FUNCTIONS_H */

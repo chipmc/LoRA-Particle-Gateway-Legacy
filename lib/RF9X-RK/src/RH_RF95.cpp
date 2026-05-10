@@ -5,14 +5,6 @@
 
 #include <RH_RF95.h>
 
-#if __has_include("config.h")
-#include "config.h"
-#endif
-
-#ifndef FIELD_DEBUG_BUILD
-#define FIELD_DEBUG_BUILD 0
-#endif
-
 // Maybe a mutex for multithreading on Raspberry Pi?
 #ifdef RH_USE_MUTEX
 RH_DECLARE_MUTEX(lock);
@@ -56,7 +48,7 @@ bool RH_RF95::init()
 #ifdef RH_USE_MUTEX
     if (RH_MUTEX_INIT(lock) != 0)
     { 
-	    Log.info("mutex init has failed");
+    	Serial.println("\n mutex init has failed\n");
     	return false;
     }
 #endif
@@ -120,13 +112,6 @@ bool RH_RF95::init()
 	    attachInterrupt(interruptNumber, isr2, RISING);
 	else
 	    return false; // Too many devices, not enough interrupt vectors
-    #if FIELD_DEBUG_BUILD
-    Log.info("LoRa IRQ attach verified: pin=%u interrupt=%d index=%u dio0=%ld mode=RISING",
-        _interruptPin,
-        interruptNumber,
-        _myInterruptIndex,
-        (long)digitalRead(_interruptPin));
-    #endif
     }
     
     // Set up FIFO
@@ -164,7 +149,6 @@ bool RH_RF95::init()
 void RH_RF95::handleInterrupt()
 {
     RH_MUTEX_LOCK(lock); // Multithreading support
-    _interruptServiceCount++;
     
     // we need the RF95 IRQ to be level triggered, or we ……have slim chance of missing events
     // https://github.com/geeksville/Meshtastic-esp32/commit/78470ed3f59f5c84fbd1325bcff1fd95b2b20183
@@ -199,15 +183,6 @@ void RH_RF95::handleInterrupt()
 	    || (_enableCRC && !(hop_channel & RH_RF95_RX_PAYLOAD_CRC_IS_ON)) ))
 //    if (_mode == RHModeRx && irq_flags & (RH_RF95_RX_TIMEOUT | RH_RF95_PAYLOAD_CRC_ERROR))
     {
-    #if FIELD_DEBUG_BUILD
-    Log.info("RH_RF95 RX reject: irq=0x%02x hop=0x%02x timeout=%u crcError=%u crcMissing=%u mode=%u",
-        irq_flags,
-        hop_channel,
-        (irq_flags & RH_RF95_RX_TIMEOUT) ? 1 : 0,
-        (irq_flags & RH_RF95_PAYLOAD_CRC_ERROR) ? 1 : 0,
-        (_enableCRC && !(hop_channel & RH_RF95_RX_PAYLOAD_CRC_IS_ON)) ? 1 : 0,
-        _mode);
-    #endif
 //	Serial.println("E");
 	_rxBad++;
         clearRxBuf();
@@ -246,31 +221,8 @@ void RH_RF95::handleInterrupt()
 	    
 	// We have received a message.
 	validateRxBuf(); 
-    if (_rxBufValid) {
-        #if FIELD_DEBUG_BUILD
-        Log.info("RH_RF95 RX done: len=%u to=%u from=%u id=%u flags=0x%02x rssi=%d snr=%d mode=%u",
-        _bufLen,
-        _rxHeaderTo,
-        _rxHeaderFrom,
-        _rxHeaderId,
-        _rxHeaderFlags,
-        _lastRssi,
-        _lastSNR,
-        _mode);
-        #endif
+	if (_rxBufValid)
 	    setModeIdle(); // Got one 
-    }
-    else {
-        #if FIELD_DEBUG_BUILD
-        Log.info("RH_RF95 RX reject: reason=header-filter len=%u to=%u this=%u from=%u id=%u flags=0x%02x",
-        _bufLen,
-        _bufLen >= 1 ? _buf[0] : 0,
-        _thisAddress,
-        _bufLen >= 2 ? _buf[1] : 0,
-        _bufLen >= 3 ? _buf[2] : 0,
-        _bufLen >= 4 ? _buf[3] : 0);
-        #endif
-    }
     }
     else if (_mode == RHModeTx && irq_flags & RH_RF95_TX_DONE)
     {
@@ -343,37 +295,8 @@ bool RH_RF95::available()
 	return false;
     }
     setModeRx();
-    const uint8_t irqFlags = spiRead(RH_RF95_REG_12_IRQ_FLAGS);
-    const bool pendingRxIrq = (irqFlags & (RH_RF95_RX_DONE | RH_RF95_PAYLOAD_CRC_ERROR | RH_RF95_VALID_HEADER | RH_RF95_RX_TIMEOUT)) != 0;
-    const int dio0Before = (_interruptPin != RH_INVALID_PIN) ? digitalRead(_interruptPin) : -1;
-    const uint32_t isrCountBefore = _interruptServiceCount;
-    const bool rxBufValidBefore = _rxBufValid;
     RH_MUTEX_UNLOCK(lock);
-    if (!rxBufValidBefore && pendingRxIrq)
-    {
-        #if FIELD_DEBUG_BUILD
-        Log.info("RH_RF95 available pending: irq=0x%02x dio0Before=%d available=0 isrCount=%lu",
-        irqFlags,
-        dio0Before,
-        (unsigned long)isrCountBefore);
-        #endif
-        processPendingRx();
-    }
-    RH_MUTEX_LOCK(lock);
-    const bool availableNow = _rxBufValid;
-    if (!rxBufValidBefore && pendingRxIrq)
-    {
-        const int dio0After = (_interruptPin != RH_INVALID_PIN) ? digitalRead(_interruptPin) : -1;
-        #if FIELD_DEBUG_BUILD
-        Log.info("RH_RF95 available result: irq=0x%02x dio0After=%d available=%u isrCount=%lu",
-        irqFlags,
-        dio0After,
-        availableNow ? 1 : 0,
-        (unsigned long)_interruptServiceCount);
-        #endif
-    }
-    RH_MUTEX_UNLOCK(lock);
-    return availableNow; // Will be set by the interrupt handler when a good message is received
+    return _rxBufValid; // Will be set by the interrupt handler when a good message is received
 }
 
 void RH_RF95::clearRxBuf()
@@ -436,32 +359,14 @@ bool RH_RF95::send(const uint8_t* data, uint8_t len)
 bool RH_RF95::printRegisters()
 {
 #ifdef RH_HAVE_SERIAL
-    uint8_t registers[] = { 0x01, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10, 0x11, 0x12, 0x13, 0x014, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f, 0x20, 0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x39, 0x42, 0x4b};
+    uint8_t registers[] = { 0x01, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10, 0x11, 0x12, 0x13, 0x014, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f, 0x20, 0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x4b};
 
     uint8_t i;
     for (i = 0; i < sizeof(registers); i++)
     {
-    const uint8_t reg = registers[i];
-    const uint8_t value = spiRead(reg);
-    Log.info("%02X: %02X", reg, value);
-    if (reg == RH_RF95_REG_12_IRQ_FLAGS)
-    {
-        const bool rxDone = (value & RH_RF95_RX_DONE) != 0;
-        const bool crcError = (value & RH_RF95_PAYLOAD_CRC_ERROR) != 0;
-        const bool validHeader = (value & RH_RF95_VALID_HEADER) != 0;
-        const bool rxTimeout = (value & RH_RF95_RX_TIMEOUT) != 0;
-        const char *conclusion = "irq-flags-present";
-        if (value == 0)
-        conclusion = "no-irq-flags-suspect-rf-path-config-or-timing";
-        else if (rxDone)
-        conclusion = "rxdone-present-if-available-stays-false-suspect-dio0-or-interrupt-handling";
-        Log.info("12 decode: RxDone=%u PayloadCrcError=%u ValidHeader=%u RxTimeout=%u conclusion=%s",
-        rxDone ? 1 : 0,
-        crcError ? 1 : 0,
-        validHeader ? 1 : 0,
-        rxTimeout ? 1 : 0,
-        conclusion);
-    }
+	Serial.print(registers[i], HEX);
+	Serial.print(": ");
+	Serial.println(spiRead(registers[i]), HEX);
     }
 #endif
     return true;
@@ -510,14 +415,9 @@ void RH_RF95::setModeRx()
     if (_mode != RHModeRx)
     {
 	modeWillChange(RHModeRx);
-    spiWrite(RH_RF95_REG_12_IRQ_FLAGS, 0xff); // Clear stale IRQ flags before arming RX
-    spiWrite(RH_RF95_REG_40_DIO_MAPPING1, 0x00); // Interrupt on RxDone
 	spiWrite(RH_RF95_REG_01_OP_MODE, RH_RF95_MODE_RXCONTINUOUS);
+	spiWrite(RH_RF95_REG_40_DIO_MAPPING1, 0x00); // Interrupt on RxDone
 	_mode = RHModeRx;
-    Log.info("RH_RF95 RX arm: irq=0x%02x dio0=%ld mode=%u",
-        spiRead(RH_RF95_REG_12_IRQ_FLAGS),
-        (long)((_interruptPin != RH_INVALID_PIN) ? digitalRead(_interruptPin) : -1),
-        _mode);
     }
 }
 
@@ -806,33 +706,5 @@ uint8_t RH_RF95::getDeviceVersion()
 {
 	_deviceVersion = spiRead(RH_RF95_REG_42_VERSION);
 	return _deviceVersion;
-}
-
-uint8_t RH_RF95::readRegister(uint8_t reg)
-{
-    return spiRead(reg);
-}
-
-bool RH_RF95::processPendingRx()
-{
-    if (_mode == RHModeTx)
-	return false;
-
-    const uint8_t irqFlags = spiRead(RH_RF95_REG_12_IRQ_FLAGS);
-    if (!(irqFlags & (RH_RF95_RX_DONE | RH_RF95_PAYLOAD_CRC_ERROR | RH_RF95_RX_TIMEOUT | RH_RF95_VALID_HEADER)))
-	return false;
-
-    handleInterrupt();
-    return _rxBufValid;
-}
-
-RHGenericDriver::RHMode RH_RF95::mode() const
-{
-    return _mode;
-}
-
-bool RH_RF95::rxBufferValid() const
-{
-    return _rxBufValid;
 }
 

@@ -219,7 +219,7 @@ bool AB1805::updateWakeReason() {
 
 bool AB1805::setWDT(int seconds) {
     bool bResult = false;
-    _log.trace("setWDT %d", seconds);
+    _log.info("setWDT %d", seconds);
 
     if (seconds < 0) {
         seconds = watchdogSecs;
