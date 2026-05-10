@@ -459,7 +459,7 @@ public:
 	 * @brief Will reset the node database - if database is corrupted of new nodes arrive
 	 * 
 	 */
-	void resetNodeIDs();
+	bool resetNodeIDs();
 
 	/**
 	 * @brief Validates values and, if valid, checks that data is in the correct range.
@@ -514,7 +514,11 @@ public:
 	 */
 
 	String get_nodeIDJson() const;
+	size_t get_nodeIDJsonLength() const;
 	bool set_nodeIDJson(const char *str);
+	bool saveNodeIDJson(const char *str, bool force = true);
+	virtual bool load() override;
+	virtual void save() override;
 	
 
 	//Members here are internal only and therefore protected
@@ -551,6 +555,8 @@ protected:
     //Since these variables are only used internally - They can be private. 
 	static const uint32_t NODEID_DATA_MAGIC = 0x20a99e60;
 	static const uint16_t NODEID_DATA_VERSION = 2;
+	static const int NODEID_PRIMARY_OFFSET = 200;
+	static const int NODEID_BACKUP_OFFSET = NODEID_PRIMARY_OFFSET + sizeof(NodeData);
 
 };
 

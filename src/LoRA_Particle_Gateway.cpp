@@ -36,6 +36,7 @@
 // v9.00 - Breaking Change - v10 Node Required - Node Now Reports RSSI / SNR to Gateway, Simplified Join Request Logic, Storing / reporting hops
 // v10.00 - Updated the power management code to encourage charging
 // v19.00 - Dual-platform Boron/Photon 2 gateway release with platform abstraction, closed-hours scheduling, P2 pin mapping, and connection diagnostics
+// v21.00 - Gateway production hardening release with FRAM repair/verification, normalized logging, battery telemetry, safe local config handling, and boot reset diagnostics
 
 #define DEFAULT_LORA_WINDOW 5
 #define STAY_CONNECTED 60
@@ -89,7 +90,9 @@ volatile bool userSwitchDectected = false;
 
 void setup() 
 {
-	waitFor(Serial.isConnected, 10000);				// Wait for serial connection
+	Serial.begin();
+	waitFor(Serial.isConnected, 30000);				// Give the USB serial monitor time to attach before boot logs
+	delay(250);
 	logGatewayBootHeader();
 
     initializePinModes();                           // Sets the pinModes
@@ -118,8 +121,11 @@ void setup()
 	// Setup local time and set the publishing schedule
 	LocalTime::instance().withConfig(LocalTimePosixTimezone("EST5EDT,M3.2.0/2:00:00,M11.1.0/2:00:00"));			// East coast of the US
 	conv.withCurrentTime().convert();  				        // Convert to local time for use later
+	const int buttonState = digitalRead(BUTTON_PIN);
+	const uint8_t connectivityMode = sysStatus.get_connectivityMode();
+	const bool timeValid = Time.isValid();
 
-	if (Time.isValid()) {
+	if (timeValid) {
 		Log.info("LocalTime initialized, time is %s and RTC %s set", conv.format("%I:%M:%S%p").c_str(), (ab1805.isRTCSet()) ? "is" : "is not");
 	}
 	else {
@@ -127,7 +133,7 @@ void setup()
 		state = CONNECTING_STATE;
 	}
 
-	if (!digitalRead(BUTTON_PIN) || sysStatus.get_connectivityMode()== 1) {
+	if (!buttonState || connectivityMode == 1) {
 		Log.info("User button or pre-existing set to connected mode");
 		sysStatus.set_connectivityMode(1);					  // connectivityMode Code 1 keeps both LoRA and Cellular connections on
 		state = CONNECTING_STATE;
@@ -379,13 +385,16 @@ void loop() {
  */
 void publishStateTransition(void)
 {
-	char stateTransitionString[256];
-	if (state == IDLE_STATE && !Time.isValid()) snprintf(stateTransitionString, sizeof(stateTransitionString), "From %s to %s with invalid time", stateNames[oldState],stateNames[state]);
-	else snprintf(stateTransitionString, sizeof(stateTransitionString), "From %s to %s", stateNames[oldState],stateNames[state]);
+	const State previousState = oldState;
 
 	oldState = state;
 
-	Log.info(stateTransitionString);
+	if (state == IDLE_STATE && !Time.isValid()) {
+		Log.info("From %s to %s with invalid time", stateNames[previousState], stateNames[state]);
+	}
+	else {
+		Log.info("From %s to %s", stateNames[previousState], stateNames[state]);
+	}
 }
 
 // Here are the various hardware and timer interrupt service routines
@@ -424,6 +433,8 @@ void publishWebhook(uint8_t nodeNumber) {
 	}
 	else {																// Webhook for the gateway
 		takeMeasurements();												// Loads the current values for the Gateway
+		const GatewayBatteryTelemetry telemetry = GatewayPlatform::lastBatteryTelemetry();
+		Log.info("Gateway battery: %.0f%% %s VBAT=%.2f source=%s", telemetry.available ? telemetry.soc : 0.0f, telemetry.contextLabel, telemetry.available ? telemetry.voltage : 0.0f, telemetry.sourceLabel);
 
 		snprintf(data, sizeof(data), "{\"deviceid\":\"%s\", \"hourly\":%u, \"daily\":%u, \"sensortype\":%d, \"battery\":%4.2f,\"key1\":\"%s\",\"temp\":%d, \"resets\":%d, \"msg\":%d, \"timestamp\":%lu000}",\
 		Particle.deviceID().c_str(), 0, 0, sysStatus.get_sensorType(), current.get_stateOfCharge(), gatewayBatteryContext(current.get_batteryState()),\

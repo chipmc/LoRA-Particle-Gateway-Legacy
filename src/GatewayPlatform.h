@@ -1,6 +1,16 @@
 #ifndef GATEWAY_PLATFORM_H
 #define GATEWAY_PLATFORM_H
 
+#if defined(__has_include)
+#if __has_include("config.h")
+#include "config.h"
+#else
+#error "Missing src/config.h. Copy src/config.example.h to src/config.h: cp src/config.example.h src/config.h"
+#endif
+#else
+#include "config.h"
+#endif
+
 #include "Particle.h"
 
 #ifndef FIELD_DEBUG_BUILD
@@ -13,6 +23,10 @@
 
 #ifndef VERBOSE_SYSTEM_LOGS
 #define VERBOSE_SYSTEM_LOGS FIELD_DEBUG_BUILD
+#endif
+
+#ifndef P2_WIFI_ANTENNA_EXTERNAL
+#define P2_WIFI_ANTENNA_EXTERNAL 0
 #endif
 
 #ifndef HAL_PLATFORM_CELLULAR
@@ -35,10 +49,24 @@
 #define SYSTEM_VERBOSE_LOG(...) do { } while (0)
 #endif
 
-#define GATEWAY_PRODUCT_VERSION 19
-#define GATEWAY_RELEASE_STRING "19.00"
+#define GATEWAY_PRODUCT_VERSION 21
+#define GATEWAY_RELEASE_STRING "21.00"
 
 static const uint8_t GATEWAY_BATTERY_STATE_NA = 7;
+static const uint8_t GATEWAY_BATTERY_STATE_ESTIMATED = 8;
+
+struct GatewayBatteryTelemetry {
+	bool available;
+	float soc;
+	float voltage;
+	const char *contextLabel;
+	const char *sourceLabel;
+};
+
+namespace GatewayPlatform {
+	GatewayBatteryTelemetry readBatteryTelemetry();
+	GatewayBatteryTelemetry lastBatteryTelemetry();
+}
 
 const char *gatewayPlatformName();
 const char *gatewayTransportName();
@@ -52,6 +80,7 @@ bool disconnectNetworkForSleep();
 bool getGatewaySignalMetrics(int &strength, int &quality);
 
 const char *gatewayBatteryContext(uint8_t batteryState);
+uint8_t gatewayBatteryContextCode(const GatewayBatteryTelemetry &telemetry);
 bool platformBatterySupported();
 void platformPrepareBatteryMeasurement();
 bool platformReadBatteryState();

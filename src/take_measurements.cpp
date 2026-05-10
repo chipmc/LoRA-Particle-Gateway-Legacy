@@ -8,9 +8,9 @@
 bool takeMeasurements() { 
 
   platformPrepareBatteryMeasurement();
-  if (platformBatterySupported()) {
+  #if HAL_PLATFORM_CELLULAR
     softDelay(1000);                                // Give the fuel gauge time to start
-  }
+  #endif
 
   // Temperature inside the enclosure
   current.set_internalTempC((int)tmp36TemperatureC(analogRead(TMP36_SENSE_PIN)));
@@ -19,7 +19,7 @@ bool takeMeasurements() {
 
   if (isItSafeToCharge()) {
     if (platformBatterySupported()) {
-      SYSTEM_VERBOSE_LOG("Battery State: %s, SOC: %2.0f%%", gatewayBatteryContext(current.get_batteryState()), current.get_stateOfCharge());
+      SYSTEM_VERBOSE_LOG("Battery State: %s, SOC: %2.0f%%, VBAT=%.2f source=%s", gatewayBatteryContext(current.get_batteryState()), current.get_stateOfCharge(), GatewayPlatform::lastBatteryTelemetry().voltage, GatewayPlatform::lastBatteryTelemetry().sourceLabel);
     }
   }
   else if (platformBatterySupported()) {

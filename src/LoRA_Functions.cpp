@@ -7,6 +7,8 @@
 #include "LocalTimeRK.h"
 #include "Particle_Functions.h"
 #include "GatewayPlatform.h"
+#include <fcntl.h>
+#include <unistd.h>
 
 extern LocalTimeConvert conv;
 
@@ -62,10 +64,74 @@ void loraDio0DiagnosticISR();
 
 namespace {
 
+const char *const NODE_DB_BAD_PATH = "/usr/nodedb.bad";
+const char *const NODE_DB_BAD_TMP_PATH = "/usr/nodedb.bad.tmp";
+
 struct GatewayScheduleHint {
 	uint16_t frequencyMinutes;
 	bool openHours;
 };
+
+bool preserveCorruptNodeDb(const char *json, size_t len) {
+	if (!json) {
+		return false;
+	}
+
+	int fd = open(NODE_DB_BAD_TMP_PATH, O_RDWR | O_CREAT | O_TRUNC, 0644);
+	if (fd < 0) {
+		return false;
+	}
+
+	bool ok = true;
+	if (len > 0) {
+		ok = (write(fd, json, len) == (ssize_t)len);
+	}
+	close(fd);
+
+	if (!ok) {
+		unlink(NODE_DB_BAD_TMP_PATH);
+		return false;
+	}
+
+	unlink(NODE_DB_BAD_PATH);
+	if (rename(NODE_DB_BAD_TMP_PATH, NODE_DB_BAD_PATH) != 0) {
+		unlink(NODE_DB_BAD_TMP_PATH);
+		return false;
+	}
+
+	return true;
+}
+
+const char *nodeDbParseReason(size_t len, bool added) {
+	if (len == 0) {
+		return "empty";
+	}
+	if (len >= sizeof(nodeIDData::NodeData::nodeIDJson)) {
+		return "missing-terminator-or-truncated";
+	}
+	if (!added) {
+		return "parser-buffer-full";
+	}
+	return "invalid-json";
+}
+
+bool parseNodeDatabase(const String &json, size_t len, bool logFailure) {
+	jp.clear();
+	const bool added = jp.addString(json.c_str());
+	const bool parsed = added && jp.parse();
+	if (!parsed && logFailure) {
+		Log.error("NodeDB parse failed: len=%u reason=%s", (unsigned)len, nodeDbParseReason(len, added));
+	}
+	return parsed;
+}
+
+unsigned int nodeDatabaseCount() {
+	const JsonParserGeneratorRK::jsmntok_t *nodesArrayContainer = nullptr;
+	if (!jp.getValueTokenByKey(jp.getOuterObject(), "nodes", nodesArrayContainer) || !nodesArrayContainer) {
+		return 0;
+	}
+	return (unsigned int)nodesArrayContainer->size;
+}
 
 bool shouldSendClosedHoursHint() {
 	conv.withCurrentTime().convert();
@@ -257,13 +323,22 @@ bool LoRA_Functions::setup(bool gatewayID) {
 	}
 
 	// Here is where we load the JSON object from memory and parse
-	jp.addString(nodeDatabase.get_nodeIDJson());				// Read in the JSON string from memory
-	SYSTEM_VERBOSE_LOG("The node string is: %s", nodeDatabase.get_nodeIDJson().c_str());
+	const String nodeDbJson = nodeDatabase.get_nodeIDJson();
+	const size_t nodeDbLen = nodeDatabase.get_nodeIDJsonLength();
+	SYSTEM_VERBOSE_LOG("The node string is: %s", nodeDbJson.c_str());
 
-	if (jp.parse()) SYSTEM_VERBOSE_LOG("Parsed Successfully");
+	if (parseNodeDatabase(nodeDbJson, nodeDbLen, true)) {
+		Log.info("NodeDB loaded: nodes=%u", nodeDatabaseCount());
+	}
 	else {
-		nodeDatabase.resetNodeIDs();
-		Log.info("Parsing error resetting nodeID database");
+		preserveCorruptNodeDb(nodeDbJson.c_str(), nodeDbLen);
+		if (nodeDatabase.resetNodeIDs()) {
+			const String repairedNodeDbJson = nodeDatabase.get_nodeIDJson();
+			const size_t repairedNodeDbLen = nodeDatabase.get_nodeIDJsonLength();
+			if (parseNodeDatabase(repairedNodeDbJson, repairedNodeDbLen, true)) {
+				Log.info("NodeDB loaded: nodes=%u", nodeDatabaseCount());
+			}
+		}
 	}
 	return true;
 }
@@ -490,7 +565,7 @@ bool LoRA_Functions::acknowledgeDataReportGateway() { 		// This is a response to
 		digitalWrite(BLUE_LED,LOW);
 
 		snprintf(messageString,sizeof(messageString),"Node %d data report %d acknowledged with alert %d, next window %s in %u minutes, and RSSI / SNR of %d / %d", current.get_nodeNumber(), buf[11], buf[8], buf[10] ? "open" : "closed", (unsigned)((buf[6] << 8) | buf[7]), current.get_RSSI(), current.get_SNR());
-		Log.info(messageString);
+		Log.info("%s", messageString);
 		if (Particle.connected()) Particle.publish("status", messageString,PRIVATE);
 		return true;
 	}
@@ -555,7 +630,7 @@ bool LoRA_Functions::acknowledgeJoinRequestGateway() {
 		current.set_tempNodeNumber(0);								// Temp no longer needed
 		digitalWrite(BLUE_LED,LOW);
 		snprintf(messageString,sizeof(messageString),"Node %d joined with sensorType %s, alert %d and RSSI / SNR of %d / %d", nodeAddress, (buf[10] ==0)? "car":"person",current.get_alertCodeNode(), current.get_RSSI(), current.get_SNR());
-		Log.info(messageString);
+		Log.info("%s", messageString);
 		if (Particle.connected()) Particle.publish("status", messageString,PRIVATE);
 		return true;
 	}
@@ -633,7 +708,7 @@ uint8_t LoRA_Functions::findNodeNumber(const char* deviceID, int radioID) {
 		mod.finishObjectOrArray();
 	mod.finish();
 
-	nodeDatabase.set_nodeIDJson(jp.getBuffer());									// This should backup the nodeID database - now updated to persistent storage
+	nodeDatabase.saveNodeIDJson(jp.getBuffer());									// This should backup the nodeID database - now updated to persistent storage
 
 	return index;
 }
@@ -698,7 +773,7 @@ bool LoRA_Functions::nodeUpdate(int nodeNumber, float successPercent)  {
 	mod.insertValue((float)successPercent);
 	mod.finish();
 
-	nodeDatabase.set_nodeIDJson(jp.getBuffer());									// This should backup the nodeID database - now updated to persistent storage
+	nodeDatabase.saveNodeIDJson(jp.getBuffer());									// This should backup the nodeID database - now updated to persistent storage
 	return true;
 }
 
@@ -746,7 +821,7 @@ bool LoRA_Functions::changeType(int nodeNumber, int newType) {
 	mod.insertValue((int)newType);
 	mod.finish();
 
-	nodeDatabase.set_nodeIDJson(jp.getBuffer());									// This should backup the nodeID database - now updated to persistent storage
+	nodeDatabase.saveNodeIDJson(jp.getBuffer());									// This should backup the nodeID database - now updated to persistent storage
 
 	return true;
 
@@ -794,7 +869,7 @@ bool LoRA_Functions::changeAlert(int nodeNumber, int newAlert) {
 	mod.insertValue((int)newAlert);
 	mod.finish();
 
-	nodeDatabase.set_nodeIDJson(jp.getBuffer());									// This updates the JSON object but doe not commit to to persistent storage
+	nodeDatabase.saveNodeIDJson(jp.getBuffer());									// This updates the JSON object and commits it to persistent storage
 
 	return true;
 }
@@ -827,7 +902,7 @@ void LoRA_Functions::printNodeData(bool publish) {
 		jp.getValueByKey(nodeObjectContainer, "pend", pendingAlert);
 
 		snprintf(data, sizeof(data), "Node %d, deviceID: %s, checksum %d, lastConnected: %s, type %d, success %4.2f with pending alert %d", nodeNumber, nodeDeviceID.c_str(), radioID, Time.timeStr(lastConnect).c_str(), sensorType, successPercent, pendingAlert);
-		Log.info(data);
+		Log.info("%s", data);
 		if (Particle.connected() && publish) {
 			Particle.publish("nodeData", data, PRIVATE);
 			delay(1000);

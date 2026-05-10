@@ -15,7 +15,18 @@ char closeTimeStr[8] = " ";
 SYSTEM_MODE(SEMI_AUTOMATIC);                        // This will enable user code to start executing automatically.
 STARTUP(System.enableFeature(FEATURE_RESET_INFO));
 
-SerialLogHandler logHandler(LOG_LEVEL_INFO);     // Easier to see the program flow
+#if VERBOSE_SYSTEM_LOGS
+SerialLogHandler logHandler(LOG_LEVEL_INFO);     // Full system verbosity for soak diagnostics
+#else
+SerialLogHandler logHandler(LOG_LEVEL_WARN, {
+  { "app", LOG_LEVEL_INFO },
+  { "system", LOG_LEVEL_WARN },
+  { "comm", LOG_LEVEL_ERROR },
+  { "net", LOG_LEVEL_ERROR },
+  { "hal", LOG_LEVEL_ERROR },
+  { "ncp", LOG_LEVEL_ERROR }
+});
+#endif
 
 Particle_Functions *Particle_Functions::_instance;
 
@@ -56,7 +67,7 @@ int Particle_Functions::jsonFunctionParser(String command) {
 
 	JsonParserStatic<1024, 80> jp;	// Global parser that supports up to 256 bytes of data and 20 tokens
 
-  Log.info(command.c_str());
+  Log.info("%s", command.c_str());
 
 	jp.clear();
 	jp.addString(command);
@@ -229,7 +240,7 @@ int Particle_Functions::jsonFunctionParser(String command) {
       success = false;
     }
 
-    Log.info(messaging);
+    Log.info("%s", messaging);
     if (Particle.connected()) Particle.publish("cmd",messaging,PRIVATE);
 	}
 	return success;

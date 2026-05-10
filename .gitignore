@@ -19,6 +19,7 @@ target/*
 .DS_Store
 *.crc_block
 *.no_crc
+src/config.h
 
 # VisualStudioCode
 .vscode/*

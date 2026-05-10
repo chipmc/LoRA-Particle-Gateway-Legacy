@@ -1,5 +1,12 @@
 # Changelog
 
+## v21.00 - 2026-05-09
+
+- Added gateway production-hardening updates for Photon 2 / P2, including VBAT-based battery telemetry with conservative SoC estimation.
+- Hardened FRAM-backed persistence by immediately saving first-boot defaults, repairing blank NodeDB state, verifying both NodeDB copies, and preserving corrupt NodeDB payloads for later inspection.
+- Normalized app-side runtime logging through the central `Log` handler, added boot reset reason/data reporting, and preserved concise Wi-Fi provisioning and battery diagnostic logs.
+- Added safe local configuration handling with a committed `src/config.example.h`, ignored `src/config.h`, and a configurable P2 antenna selection define.
+
 ## v19.00 - 2026-05-08
 
 - Added platform abstraction so the gateway supports Boron and Photon 2 / P2 from one codebase.
