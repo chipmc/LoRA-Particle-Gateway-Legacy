@@ -2,10 +2,15 @@
 #include <RHMesh.h>
 #include <RH_RF95.h>						        // https://docs.particle.io/reference/device-os/libraries/r/RH_RF95/
 #include "device_pinout.h"
-#include "config.h"
 #include "MyPersistentData.h"
 #include "JsonParserGeneratorRK.h"
+#include "LocalTimeRK.h"
 #include "Particle_Functions.h"
+#include "GatewayPlatform.h"
+#include <fcntl.h>
+#include <unistd.h>
+
+extern LocalTimeConvert conv;
 
 // Singleton instantiation - from template
 LoRA_Functions *LoRA_Functions::_instance;
@@ -30,33 +35,6 @@ LoRA_Functions::~LoRA_Functions() {
 // JSON for node data
 JsonParserStatic<1024, 50> jp;						// Make this global - reduce possibility of fragmentation
 
-namespace {
-	const unsigned long NODE_HEALTH_WINDOW_SECONDS = 60UL * 60UL;
-
-	void formatNodeHealthLine(char *buffer, size_t bufferSize, int nodeNumber, const String &nodeDeviceID, time_t lastConnect, float successPercent, int pendingAlert) {
-		const bool validLastCheck = (lastConnect > 0) && Time.isValid();
-		const unsigned long secondsSinceLast = (validLastCheck && Time.now() >= lastConnect) ? (unsigned long)(Time.now() - lastConnect) : 0UL;
-		const bool healthy = validLastCheck && (secondsSinceLast <= NODE_HEALTH_WINDOW_SECONDS);
-
-		if (validLastCheck) {
-			snprintf(buffer, bufferSize, "Node%d - ID %s, %s. Last check-in %lu min ago, success %4.2f, pending alert %d",
-				nodeNumber,
-				nodeDeviceID.c_str(),
-				healthy ? "healthy" : "unhealthy",
-				secondsSinceLast / 60UL,
-				successPercent,
-				pendingAlert);
-		}
-		else {
-			snprintf(buffer, bufferSize, "Node%d - ID %s, unhealthy. Last check-in unavailable, success %4.2f, pending alert %d",
-				nodeNumber,
-				nodeDeviceID.c_str(),
-				successPercent,
-				pendingAlert);
-		}
-	}
-}
-
 
 // ************************************************************************
 // *****                      LoRA Setup                              *****
@@ -74,11 +52,244 @@ typedef enum { NULL_STATE, JOIN_REQ, JOIN_ACK, DATA_RPT, DATA_ACK, ALERT_RPT, AL
 char loraStateNames[7][16] = {"Null", "Join Req", "Join Ack", "Data Report", "Data Ack", "Alert Rpt", "Alert Ack"};
 static LoRA_State lora_state = NULL_STATE;
 
+volatile uint32_t loraDio0InterruptCount = 0;
+
+const uint8_t GATEWAY_TX_POWER_DBM = 23;
+const uint16_t GATEWAY_MANAGER_TIMEOUT_MS = 2000;
+const RH_RF95::ModemConfigChoice GATEWAY_MODEM_CONFIG = RH_RF95::Bw125Cr45Sf2048;
+const char *const GATEWAY_MODEM_CONFIG_NAME = "Bw125Cr45Sf2048";
+const char *const RADIOHEAD_GIT_DIFF_STATUS = "build-source git diff clean for RadioHead/RH_RF95/RHMesh/RHDatagram";
+
+void loraDio0DiagnosticISR();
+
+namespace {
+
+const char *const NODE_DB_BAD_PATH = "/usr/nodedb.bad";
+const char *const NODE_DB_BAD_TMP_PATH = "/usr/nodedb.bad.tmp";
+
+struct GatewayScheduleHint {
+	uint16_t frequencyMinutes;
+	bool openHours;
+};
+
+bool preserveCorruptNodeDb(const char *json, size_t len) {
+	if (!json) {
+		return false;
+	}
+
+	int fd = open(NODE_DB_BAD_TMP_PATH, O_RDWR | O_CREAT | O_TRUNC, 0644);
+	if (fd < 0) {
+		return false;
+	}
+
+	bool ok = true;
+	if (len > 0) {
+		ok = (write(fd, json, len) == (ssize_t)len);
+	}
+	close(fd);
+
+	if (!ok) {
+		unlink(NODE_DB_BAD_TMP_PATH);
+		return false;
+	}
+
+	unlink(NODE_DB_BAD_PATH);
+	if (rename(NODE_DB_BAD_TMP_PATH, NODE_DB_BAD_PATH) != 0) {
+		unlink(NODE_DB_BAD_TMP_PATH);
+		return false;
+	}
+
+	return true;
+}
+
+const char *nodeDbParseReason(size_t len, bool added) {
+	if (len == 0) {
+		return "empty";
+	}
+	if (len >= sizeof(nodeIDData::NodeData::nodeIDJson)) {
+		return "missing-terminator-or-truncated";
+	}
+	if (!added) {
+		return "parser-buffer-full";
+	}
+	return "invalid-json";
+}
+
+bool parseNodeDatabase(const String &json, size_t len, bool logFailure) {
+	jp.clear();
+	const bool added = jp.addString(json.c_str());
+	const bool parsed = added && jp.parse();
+	if (!parsed && logFailure) {
+		Log.error("NodeDB parse failed: len=%u reason=%s", (unsigned)len, nodeDbParseReason(len, added));
+	}
+	return parsed;
+}
+
+unsigned int nodeDatabaseCount() {
+	const JsonParserGeneratorRK::jsmntok_t *nodesArrayContainer = nullptr;
+	if (!jp.getValueTokenByKey(jp.getOuterObject(), "nodes", nodesArrayContainer) || !nodesArrayContainer) {
+		return 0;
+	}
+	return (unsigned int)nodesArrayContainer->size;
+}
+
+bool shouldSendClosedHoursHint() {
+	conv.withCurrentTime().convert();
+	const int currentHour = conv.getLocalTimeHMS().hour;
+	return (currentHour >= sysStatus.get_closeTime() || currentHour < sysStatus.get_openTime());
+}
+
+uint16_t minutesUntilNextOpening() {
+	conv.withCurrentTime().convert();
+	const auto localTime = conv.getLocalTimeHMS();
+	int hoursUntilOpen = (int)sysStatus.get_openTime() - localTime.hour;
+	if (hoursUntilOpen < 0) {
+		hoursUntilOpen += 24;
+	}
+	const unsigned long secondsUntilOpen = (unsigned long)hoursUntilOpen * 3600UL
+		- ((unsigned long)localTime.minute * 60UL)
+		- (unsigned long)localTime.second;
+	return (uint16_t)max(1UL, (secondsUntilOpen + 59UL) / 60UL);
+}
+
+GatewayScheduleHint gatewayScheduleHint() {
+	if (shouldSendClosedHoursHint()) {
+		return {minutesUntilNextOpening(), false};
+	}
+	return {sysStatus.get_frequencyMinutes(), true};
+}
+
+} // anonymous namespace
+
+static const char *rhModeName(RHGenericDriver::RHMode mode) __attribute__((unused));
+
+static const char *rhModeName(RHGenericDriver::RHMode mode) {
+	switch (mode) {
+		case RHGenericDriver::RHModeInitialising:
+			return "initialising";
+		case RHGenericDriver::RHModeSleep:
+			return "sleep";
+		case RHGenericDriver::RHModeIdle:
+			return "idle";
+		case RHGenericDriver::RHModeTx:
+			return "tx";
+		case RHGenericDriver::RHModeRx:
+			return "rx";
+		case RHGenericDriver::RHModeCad:
+			return "cad";
+		default:
+			return "unknown";
+	}
+}
+
 // Singleton instance of the radio driver
-RH_RF95 driver(RFM95_CS, RFM95_INT);
+class DiagnosticRH_RF95 : public RH_RF95 {
+public:
+	static DiagnosticRH_RF95 *interruptOwner;
+
+	DiagnosticRH_RF95(uint8_t slaveSelectPin, uint8_t interruptPin) : RH_RF95(slaveSelectPin, interruptPin) {
+	}
+
+	void attachDiagnosticInterrupt() {
+		interruptOwner = this;
+		attachInterrupt(RFM95_INT, loraDio0DiagnosticISR, RISING);
+	}
+
+	void handleDiagnosticInterrupt() {
+		RH_RF95::handleInterrupt();
+	}
+
+	uint8_t getIrqFlagsRegister() {
+		return spiRead(RH_RF95_REG_12_IRQ_FLAGS);
+	}
+};
+
+DiagnosticRH_RF95 *DiagnosticRH_RF95::interruptOwner = nullptr;
+
+void loraDio0DiagnosticISR() {
+	loraDio0InterruptCount++;
+	if (DiagnosticRH_RF95::interruptOwner) {
+		DiagnosticRH_RF95::interruptOwner->handleDiagnosticInterrupt();
+	}
+}
+
+DiagnosticRH_RF95 driver(RFM95_CS, RFM95_INT);
+
+class DiagnosticRHMesh : public RHMesh {
+public:
+	DiagnosticRHMesh(RHGenericDriver& driver, uint8_t thisAddress) : RHMesh(driver, thisAddress) {
+	}
+
+	bool recvfromAck(uint8_t* payload, uint8_t* payloadLen, uint8_t* source = NULL, uint8_t* dest = NULL, uint8_t* id = NULL, uint8_t* flags = NULL, uint8_t* hops = NULL) {
+		uint8_t tmpMessageLen = sizeof(diagnosticMessage);
+		uint8_t routeSource;
+		uint8_t routeDest;
+		uint8_t routeId;
+		uint8_t routeFlags;
+		uint8_t routeHops;
+
+		if (RHRouter::recvfromAck(diagnosticMessage, &tmpMessageLen, &routeSource, &routeDest, &routeId, &routeFlags, &routeHops)) {
+			MeshMessageHeader* meshHeader = (MeshMessageHeader*)&diagnosticMessage;
+
+			if (tmpMessageLen >= 1 && meshHeader->msgType == RH_MESH_MESSAGE_TYPE_APPLICATION) {
+				MeshApplicationMessage* applicationMessage = (MeshApplicationMessage*)meshHeader;
+				if (source) *source = routeSource;
+				if (dest) *dest = routeDest;
+				if (id) *id = routeId;
+				if (flags) *flags = routeFlags;
+				if (hops) *hops = routeHops;
+				uint8_t messageLen = tmpMessageLen - sizeof(MeshMessageHeader);
+				if (*payloadLen > messageLen) {
+					*payloadLen = messageLen;
+				}
+				memcpy(payload, applicationMessage->data, *payloadLen);
+				return true;
+			}
+			else if (routeDest == RH_BROADCAST_ADDRESS && tmpMessageLen > 1 && meshHeader->msgType == RH_MESH_MESSAGE_TYPE_ROUTE_DISCOVERY_REQUEST) {
+				MeshRouteDiscoveryMessage* discoveryMessage = (MeshRouteDiscoveryMessage*)meshHeader;
+				uint8_t routeCount = tmpMessageLen - sizeof(MeshMessageHeader) - 2;
+
+				LORA_DIAG_LOG("LoRa diag route req src=%u via=%u dest=%u hops=%u rssi=%d snr=%d", routeSource, headerFrom(), discoveryMessage->dest, routeHops, driver.lastRssi(), driver.lastSNR());
+
+				if (routeSource == _thisAddress) {
+					return false;
+				}
+
+				for (uint8_t routeIndex = 0; routeIndex < routeCount; routeIndex++) {
+					if (discoveryMessage->route[routeIndex] == _thisAddress) {
+						return false;
+					}
+				}
+
+				addRouteTo(routeSource, headerFrom());
+
+				if (_isa_router) {
+					for (uint8_t routeIndex = 0; routeIndex < routeCount; routeIndex++) {
+						addRouteTo(discoveryMessage->route[routeIndex], headerFrom());
+					}
+				}
+
+				if (isPhysicalAddress(&discoveryMessage->dest, discoveryMessage->destlen)) {
+					discoveryMessage->header.msgType = RH_MESH_MESSAGE_TYPE_ROUTE_DISCOVERY_RESPONSE;
+					uint8_t routeResult __attribute__((unused)) = RHRouter::sendtoWait((uint8_t*)discoveryMessage, tmpMessageLen, routeSource);
+					LORA_DIAG_LOG("LoRa diag route rsp %s to=%u for=%u code=%u", (routeResult == RH_ROUTER_ERROR_NONE) ? "sent" : "failed", routeSource, discoveryMessage->dest, routeResult);
+				}
+				else if ((routeCount < _max_hops) && _isa_router) {
+					discoveryMessage->route[routeCount] = _thisAddress;
+					tmpMessageLen++;
+					RHRouter::sendtoFromSourceWait(diagnosticMessage, tmpMessageLen, RH_BROADCAST_ADDRESS, routeSource);
+				}
+			}
+		}
+		return false;
+	}
+
+private:
+	uint8_t diagnosticMessage[RH_ROUTER_MAX_MESSAGE_LEN];
+};
 
 // Class to manage message delivery and receipt, using the driver declared above
-RHMesh manager(driver, GATEWAY_ADDRESS);
+DiagnosticRHMesh manager(driver, GATEWAY_ADDRESS);
 
 // Mesh has much greater memory requirements, and you may need to limit the
 // max message length to prevent wierd crashes
@@ -91,118 +302,15 @@ RHMesh manager(driver, GATEWAY_ADDRESS);
 // #define RH_MESH_MAX_MESSAGE_LEN 50
 uint8_t buf[RH_MESH_MAX_MESSAGE_LEN];               // Related to max message size - RadioHead example note: dont put this on the stack:
 
-namespace {
-	const uint8_t GATEWAY_MODEM_CONFIG_INDEX = 3;
-	const uint16_t GATEWAY_TIMEOUT_MS = 2000;
-	const int GATEWAY_TX_POWER_DBM = 23;
-	const uint16_t GATEWAY_PREAMBLE_BYTES = 8;
-	const char *GATEWAY_MODEM_CONFIG_NAME = "Bw125Cr48Sf4096";
-
-	const char *radioModeName(RHGenericDriver::RHMode mode) {
-		switch (mode) {
-			case RHGenericDriver::RHModeInitialising: return "initialising";
-			case RHGenericDriver::RHModeSleep: return "sleep";
-			case RHGenericDriver::RHModeIdle: return "idle";
-			case RHGenericDriver::RHModeTx: return "tx";
-			case RHGenericDriver::RHModeRx: return "rx";
-			case RHGenericDriver::RHModeCad: return "cad";
-			default: return "unknown";
-		}
-	}
-
-	void logRadioPinMap(const char *context) {
-		#if FIELD_DEBUG_BUILD
-		Log.info("%s: cs=%d rst=%d irq=%d spi=SPI", context, RFM95_CS, RFM95_RST, RFM95_INT);
-		#else
-		(void)context;
-		#endif
-	}
-
-	void logRadioRegisters(const char *context) {
-		#if FIELD_DEBUG_BUILD
-		Log.info("%s: expectedRegVersion=0x12 mode=%s register dump follows", context, radioModeName(driver.mode()));
-		driver.printRegisters();
-		#else
-		(void)context;
-		#endif
-	}
-
-	#if LORA_RAW_TEST
-	__attribute__((unused)) void logRawReceiveSnapshot(const char *context) {
-		#if FIELD_DEBUG_BUILD
-		Log.info("%s: mode=%s snapshot regs=0x12,0x13,0x16,0x17,0x18,0x1B,0x39,0x42 follows", context, radioModeName(driver.mode()));
-		driver.printRegisters();
-		#else
-		(void)context;
-		#endif
-	}
-	#endif
-
-	void logRadioInitResult(const char *context, bool managerInitOk, bool frequencyOk, bool modemOk, bool rxArmed) {
-		Log.info("%s: managerInit=%u setFrequency=%u freq=%.2f modem=%s(%u) txPower=%d timeout=%u sync=default-lora preamble=%u crc=1 addr=%u rxArmed=%u mode=%s",
-			context,
-			managerInitOk ? 1 : 0,
-			frequencyOk ? 1 : 0,
-			RF95_FREQ,
-			GATEWAY_MODEM_CONFIG_NAME,
-			GATEWAY_MODEM_CONFIG_INDEX,
-			GATEWAY_TX_POWER_DBM,
-			GATEWAY_TIMEOUT_MS,
-			GATEWAY_PREAMBLE_BYTES,
-			manager.thisAddress(),
-			rxArmed ? 1 : 0,
-			radioModeName(driver.mode()));
-	}
-
-	#if LORA_RAW_TEST
-	__attribute__((unused)) void makePrintablePayload(const uint8_t *payload, uint8_t len, char *out, size_t outSize) {
-		const size_t usable = (outSize > 0) ? outSize - 1 : 0;
-		size_t writeIndex = 0;
-		for (uint8_t index = 0; index < len && writeIndex < usable; ++index) {
-			const char ch = (char)payload[index];
-			out[writeIndex++] = isprint((unsigned char)ch) ? ch : '.';
-		}
-		out[writeIndex] = '\0';
-	}
-
-	__attribute__((unused)) void makeHexPayload(const uint8_t *payload, uint8_t len, char *out, size_t outSize) {
-		const size_t usable = (outSize > 0) ? outSize - 1 : 0;
-		size_t writeIndex = 0;
-		for (uint8_t index = 0; index < len && writeIndex < usable; ++index) {
-			const int written = snprintf(&out[writeIndex], usable - writeIndex + 1, "%s%02X", (index == 0) ? "" : " ", payload[index]);
-			if (written <= 0) {
-				break;
-			}
-			if ((size_t)written > usable - writeIndex) {
-				writeIndex = usable;
-				break;
-			}
-			writeIndex += (size_t)written;
-		}
-		out[writeIndex] = '\0';
-	}
-	#endif
-
-	void logGatewayRxArmed() {
-		Log.info("LoRa RX armed: freq=%.2f modem=%s(%u) timeout=%u addr=%u rx=1 dio0=%ld",
-			RF95_FREQ,
-			GATEWAY_MODEM_CONFIG_NAME,
-			GATEWAY_MODEM_CONFIG_INDEX,
-			GATEWAY_TIMEOUT_MS,
-			manager.thisAddress(),
-			(long)digitalRead(RFM95_INT));
-	}
-}
-
 bool LoRA_Functions::setup(bool gatewayID) {
     // Set up the Radio Module
-	logRadioPinMap("LoRa pin map boot");
 	LoRA_Functions::initializeRadio();
-	logRadioRegisters("LoRa boot radio status");
 
 	if (gatewayID == true) {
 		sysStatus.set_nodeNumber(GATEWAY_ADDRESS);							// Gateway - Manager is initialized by default with GATEWAY_ADDRESS - make sure it is stored in FRAM
 		Log.info("LoRA Radio initialized as a gateway (address %d) with a deviceID of %s", GATEWAY_ADDRESS, System.deviceID().c_str());
+		LORA_DIAG_LOG("LoRa diag setup: addr=%u freq=%.2f modem=%d/%s timeout=%u tx=%u pins cs=%d irq=%d rst=%d", manager.thisAddress(), RF95_FREQ, (int)GATEWAY_MODEM_CONFIG, GATEWAY_MODEM_CONFIG_NAME, GATEWAY_MANAGER_TIMEOUT_MS, GATEWAY_TX_POWER_DBM, (int)RFM95_CS, (int)RFM95_INT, (int)RFM95_RST);
+		LORA_DIAG_LOG("LoRa diag setup: rh_rf95_version=0x%02x source_check=%s", driver.getDeviceVersion(), RADIOHEAD_GIT_DIFF_STATUS);
 	}
 	else if (sysStatus.get_nodeNumber() > 0 && sysStatus.get_nodeNumber() <= 10) {
 		manager.setThisAddress(sysStatus.get_nodeNumber());// Node - use the Node address in valid range from memory
@@ -215,16 +323,22 @@ bool LoRA_Functions::setup(bool gatewayID) {
 	}
 
 	// Here is where we load the JSON object from memory and parse
-	jp.addString(nodeDatabase.get_nodeIDJson());				// Read in the JSON string from memory
-	Log.info("The node string is: %s",nodeDatabase.get_nodeIDJson().c_str());
+	const String nodeDbJson = nodeDatabase.get_nodeIDJson();
+	const size_t nodeDbLen = nodeDatabase.get_nodeIDJsonLength();
+	SYSTEM_VERBOSE_LOG("The node string is: %s", nodeDbJson.c_str());
 
-	if (jp.parse()) {
-		Log.info("Parsed Successfully");
-		printNodeData(false);
+	if (parseNodeDatabase(nodeDbJson, nodeDbLen, true)) {
+		Log.info("NodeDB loaded: nodes=%u", nodeDatabaseCount());
 	}
 	else {
-		nodeDatabase.resetNodeIDs();
-		Log.info("Parsing error resetting nodeID database");
+		preserveCorruptNodeDb(nodeDbJson.c_str(), nodeDbLen);
+		if (nodeDatabase.resetNodeIDs()) {
+			const String repairedNodeDbJson = nodeDatabase.get_nodeIDJson();
+			const size_t repairedNodeDbLen = nodeDatabase.get_nodeIDJsonLength();
+			if (parseNodeDatabase(repairedNodeDbJson, repairedNodeDbLen, true)) {
+				Log.info("NodeDB loaded: nodes=%u", nodeDatabaseCount());
+			}
+		}
 	}
 	return true;
 }
@@ -241,33 +355,59 @@ void LoRA_Functions::loop() {
 
 void LoRA_Functions::clearBuffer() {
 	uint8_t bufT[RH_RF95_MAX_MESSAGE_LEN];
-	uint8_t lenT;
-
-	while(driver.recv(bufT, &lenT)) {};
+	while (true) {
+		uint8_t lenT = sizeof(bufT);
+		if (!driver.recv(bufT, &lenT)) {
+			break;
+		}
+	}
 }
 
 void LoRA_Functions::sleepLoRaRadio() {
 	driver.sleep();                             	// Here is where we will power down the LoRA radio module
 }
 
-void LoRA_Functions::wakeLoRaRadio() {
-	logRadioPinMap("LoRa pin map LoRA_STATE");
-	const bool initOk = LoRA_Functions::initializeRadio();
-	if (!initOk) {
-		Log.info("LoRa RX arm failed: freq=%.2f modem=%s(%u) timeout=%u addr=%u rx=0",
-			RF95_FREQ,
-			GATEWAY_MODEM_CONFIG_NAME,
-			GATEWAY_MODEM_CONFIG_INDEX,
-			GATEWAY_TIMEOUT_MS,
-			manager.thisAddress());
-		logRadioRegisters("LoRa wake failure radio status");
+void LoRA_Functions::logGatewayStateEntry() {
+	#if !LORA_DIAGNOSTICS
+	return;
+	#else
+	manager.available();
+	const RHGenericDriver::RHMode mode __attribute__((unused)) = driver.mode();
+	LORA_DIAG_LOG("LoRa diag state: rx_armed=%s mode=%s addr=%u freq=%.2f modem=%s timeout=%u", (mode == RHGenericDriver::RHModeRx) ? "yes" : "no", rhModeName(mode), manager.thisAddress(), RF95_FREQ, GATEWAY_MODEM_CONFIG_NAME, GATEWAY_MANAGER_TIMEOUT_MS);
+	#endif
+}
+
+void LoRA_Functions::attachGatewayDio0DiagnosticInterrupt() {
+	if (!LORA_DIAGNOSTICS) {
 		return;
 	}
-	LoRA_Functions::clearBuffer();
-	driver.setModeRx();
-	logRadioInitResult("LoRa wake reinit", true, true, true, driver.mode() == RHGenericDriver::RHModeRx);
-	logRadioRegisters("LoRa LoRA_STATE radio status");
-	logGatewayRxArmed();
+	driver.attachDiagnosticInterrupt();
+}
+
+void LoRA_Functions::logGatewayDio0Setup(const char *context) {
+	if (!LORA_DIAGNOSTICS) {
+		return;
+	}
+	LORA_DIAG_LOG("LoRa diag dio0 %s: irq_pin=%d level=%d count=%lu", context, (int)RFM95_INT, (int)digitalRead(RFM95_INT), (unsigned long)loraDio0InterruptCount);
+}
+
+void LoRA_Functions::logGatewayDio0Snapshot() {
+	#if !LORA_DIAGNOSTICS
+	return;
+	#else
+	static uint32_t lastLoggedDio0Count = 0;
+	static system_tick_t lastSnapshotMs = 0;
+	const uint32_t dio0Count = loraDio0InterruptCount;
+	const uint8_t irqFlags = driver.getIrqFlagsRegister();
+	if (dio0Count == lastLoggedDio0Count && irqFlags == 0 && (millis() - lastSnapshotMs) < 30000UL) {
+		return;
+	}
+	const bool managerAvailable __attribute__((unused)) = manager.available();
+	const bool driverAvailable __attribute__((unused)) = driver.available();
+	lastLoggedDio0Count = dio0Count;
+	lastSnapshotMs = millis();
+	LORA_DIAG_LOG("LoRa diag dio0: level=%d count=%lu mode=%s irq_flags=0x%02x rx_done=%s crc_error=%s manager_available=%s driver_available=%s", (int)digitalRead(RFM95_INT), (unsigned long)loraDio0InterruptCount, rhModeName(driver.mode()), irqFlags, (irqFlags & RH_RF95_RX_DONE) ? "yes" : "no", (irqFlags & RH_RF95_PAYLOAD_CRC_ERROR) ? "yes" : "no", managerAvailable ? "yes" : "no", driverAvailable ? "yes" : "no");
+	#endif
 }
 
 bool  LoRA_Functions::initializeRadio() {  			// Set up the Radio Module
@@ -276,22 +416,17 @@ bool  LoRA_Functions::initializeRadio() {  			// Set up the Radio Module
 	digitalWrite(RFM95_RST,HIGH);
 	delay(10);
 
-	const bool managerInitOk = manager.init();
-	if (!managerInitOk) {
+	if (!manager.init()) {
 		Log.info("init failed");					// Defaults after init are 434.0MHz, 0.05MHz AFC pull-in, modulation FSK_Rb2_4Fd36
-		logRadioInitResult("LoRa radio init", false, false, false, false);
 		return false;
 	}
-	const bool frequencyOk = driver.setFrequency(RF95_FREQ);					// Frequency is typically 868.0 or 915.0 in the Americas, or 433.0 in the EU - Are there more settings possible here?
-	driver.setTxPower(GATEWAY_TX_POWER_DBM, false);                   // If you are using RFM95/96/97/98 modules which uses the PA_BOOST transmitter pin, then you can set transmitter powers from 5 to 23 dBm (13dBm default).  PA_BOOST?
-	const bool modemOk = driver.setModemConfig(static_cast<RH_RF95::ModemConfigChoice>(GATEWAY_MODEM_CONFIG_INDEX));
+	driver.setFrequency(RF95_FREQ);					// Frequency is typically 868.0 or 915.0 in the Americas, or 433.0 in the EU - Are there more settings possible here?
+	driver.setTxPower(GATEWAY_TX_POWER_DBM, false); // If you are using RFM95/96/97/98 modules which uses the PA_BOOST transmitter pin, then you can set transmitter powers from 5 to 23 dBm (13dBm default).  PA_BOOST?
+	driver.setModemConfig(GATEWAY_MODEM_CONFIG);
 	//driver.setModemConfig(RH_RF95::Bw125Cr48Sf4096);	// This optimized the radio for long range - https://www.airspayce.com/mikem/arduino/RadioHead/classRH__RF95.html
-	driver.setPreambleLength(GATEWAY_PREAMBLE_BYTES);
 	driver.setLowDatarate();						// https://www.airspayce.com/mikem/arduino/RadioHead/classRH__RF95.html#a8e2df6a6d2cb192b13bd572a7005da67
-	driver.setPayloadCRC(true);
-	manager.setTimeout(GATEWAY_TIMEOUT_MS);						// 200mSec is the default - may need to extend once we play with other settings on the modem - https://www.airspayce.com/mikem/arduino/RadioHead/classRHReliableDatagram.html
-	logRadioInitResult("LoRa radio init", managerInitOk, frequencyOk, modemOk, false);
-	return frequencyOk && modemOk;
+	manager.setTimeout(GATEWAY_MANAGER_TIMEOUT_MS);			// 200mSec is the default - may need to extend once we play with other settings on the modem - https://www.airspayce.com/mikem/arduino/RadioHead/classRHReliableDatagram.html
+return true;
 }
 
 
@@ -303,169 +438,58 @@ bool  LoRA_Functions::initializeRadio() {  			// Set up the Radio Module
 
 bool LoRA_Functions::listenForLoRAMessageGateway() {
 	uint8_t len = sizeof(buf);
-	#if LORA_RAW_TEST
-	static __attribute__((unused)) system_tick_t lastRawIdleLog = 0;
-	#endif
-
-#if !LORA_RAW_TEST
 	uint8_t from;
 	uint8_t dest;
 	uint8_t id;
 	uint8_t messageFlag;
 	uint8_t hops;
-	static system_tick_t lastListenIdleLog = 0;
-#endif
-
-#if LORA_RAW_TEST
-	const bool rawAvailable = driver.available();
-	const uint8_t rawIrqFlags = driver.readRegister(RH_RF95_REG_12_IRQ_FLAGS);
-	const bool rawRxDone = (rawIrqFlags & RH_RF95_RX_DONE) != 0;
-	const bool rawCrcError = (rawIrqFlags & RH_RF95_PAYLOAD_CRC_ERROR) != 0;
-	if (rawAvailable) {
-		char payloadText[RH_RF95_MAX_MESSAGE_LEN + 1];
-		char payloadHex[(RH_RF95_MAX_MESSAGE_LEN * 3) + 1];
-		len = sizeof(buf);
-		const bool rawRecvOk = driver.recv(buf, &len);
-		if (rawRecvOk) {
-			lastRawIdleLog = millis();
-			makePrintablePayload(buf, len, payloadText, sizeof(payloadText));
-			makeHexPayload(buf, len, payloadHex, sizeof(payloadHex));
-			Log.info("LoRa raw packet: available=1 recv=1 mode=%s len=%u rssi=%d snr=%d text='%s' hex=%s",
-				radioModeName(driver.mode()),
-				len,
-				driver.lastRssi(),
-				driver.lastSNR(),
-				payloadText,
-				payloadHex);
-			return true;
-		}
-		Log.info("LoRa raw recv failed: available=1 recv=0 mode=%s", radioModeName(driver.mode()));
-	}
-	else if (rawRxDone && !rawCrcError) {
-		char payloadText[RH_RF95_MAX_MESSAGE_LEN + 1];
-		char payloadHex[(RH_RF95_MAX_MESSAGE_LEN * 3) + 1];
-		#if FIELD_DEBUG_BUILD
-		Log.info("LoRa raw RX fallback: RxDone without available(), reading FIFO");
-		#endif
-		if (driver.processPendingRx()) {
-			len = sizeof(buf);
-			const bool rawRecvOk = driver.recv(buf, &len);
-			if (rawRecvOk) {
-				lastRawIdleLog = millis();
-				makePrintablePayload(buf, len, payloadText, sizeof(payloadText));
-				makeHexPayload(buf, len, payloadHex, sizeof(payloadHex));
-				Log.info("LoRa raw packet: available=0 recv=1 fallback=1 mode=%s len=%u rssi=%d snr=%d irq=0x%02x text='%s' hex=%s",
-					radioModeName(driver.mode()),
-					len,
-					driver.lastRssi(),
-					driver.lastSNR(),
-					rawIrqFlags,
-					payloadText,
-					payloadHex);
-				return true;
-			}
-			Log.info("LoRa raw fallback recv failed: irq=0x%02x mode=%s", rawIrqFlags, radioModeName(driver.mode()));
-		}
-		else {
-			Log.info("LoRa raw fallback process failed: irq=0x%02x mode=%s", rawIrqFlags, radioModeName(driver.mode()));
-		}
-	}
-	else if (rawRxDone && rawCrcError) {
-		#if FIELD_DEBUG_BUILD
-		Log.info("LoRa raw CRC error: irq=0x%02x mode=%s", rawIrqFlags, radioModeName(driver.mode()));
-		#endif
-		driver.processPendingRx();
-	}
-	else if (millis() - lastRawIdleLog >= 15000) {
-		lastRawIdleLog = millis();
-		#if FIELD_DEBUG_BUILD
-		Log.info("LoRa raw listen idle: addr=%u available=0 mode=%s no raw packets for 15s",
-			manager.thisAddress(),
-			radioModeName(driver.mode()));
-		logRawReceiveSnapshot("LoRa raw idle snapshot");
-		#endif
-	}
-	return false;
-#else
-
 	if (manager.recvfromAck(buf, &len, &from, &dest, &id, &messageFlag, &hops)) {	// We have received a message - need to validate it
-		lastListenIdleLog = millis();
-		Log.info("LoRa packet received: from=%u dest=%u id=%u flags=0x%02x hops=%u len=%u rssi=%d snr=%d",
-			from,
-			dest,
-			id,
-			messageFlag,
-			hops,
-			len,
-			driver.lastRssi(),
-			driver.lastSNR());
-		buf[len] = 0;
+		LORA_DIAG_LOG("LoRa diag recvfromAck: ok from=%u to=%u id=%u flags=0x%02x hops=%u rssi=%d snr=%d", from, dest, id, messageFlag, hops, driver.lastRssi(), driver.lastSNR());
 
+		// First we will validate that this node belongs in this network by checking the magic number
 		if (!((buf[0] << 8 | buf[1]) == sysStatus.get_magicNumber())) {
-			Log.info("LoRa packet ignored: from=%u dest=%u reason=magic-mismatch packet=%u expected=%u",
-				from,
-				dest,
-				(buf[0] << 8 | buf[1]),
-				sysStatus.get_magicNumber());
+			Log.info("Node %d message magic number of %d did not match the Magic Number in memory %d - Ignoring", current.get_nodeNumber(), (buf[0] << 8 | buf[1]), sysStatus.get_magicNumber());
 			return false;
 		}
-
-		current.set_nodeNumber(from);
-		current.set_tempNodeNumber(0);
-		current.set_hops(hops);
-		current.set_nodeID(buf[2] << 8 | buf[3]);
-		lora_state = (LoRA_State)(0x0F & messageFlag);
+		current.set_nodeNumber(from);												// Captures the nodeNumber
+		current.set_tempNodeNumber(0);											// Clear for new response
+		current.set_hops(hops);													// How many hops to get here
+		current.set_nodeID(buf[2] << 8 | buf[3]);								// Captures the nodeID for Data or Alert reports
+		lora_state = (LoRA_State)(0x0F & messageFlag);								// Strip out the overhead byte to get the message flag
+		if (lora_state == DATA_RPT) {
+			LORA_DIAG_LOG("LoRa diag data_rpt: node=%u id=%u hops=%u rssi=%d snr=%d", from, current.get_nodeID(), hops, driver.lastRssi(), driver.lastSNR());
+		}
 		Log.info("Node %d with ID %d a %s message with RSSI/SNR of %d / %d in %d hops", current.get_nodeNumber(), current.get_nodeID(), loraStateNames[lora_state], driver.lastRssi(), driver.lastSNR(), current.get_hops());
 
+		// Next we need to test the nodeNumber / deviceID to make sure this node is properly configured
 		if (current.get_nodeNumber() < 11 && !LoRA_Functions::instance().nodeConfigured(current.get_nodeNumber(), current.get_nodeID())) {
-			Log.info("LoRa packet ignored for normal routing: from=%u radioId=%d reason=node-not-configured", from, current.get_nodeID());
-			current.set_tempNodeNumber(current.get_nodeNumber());
-			current.set_nodeNumber(11);
+			Log.info("Node not properly configured, resetting node number");
+			current.set_tempNodeNumber(current.get_nodeNumber());					// Store node number in temp for the repsonse
+			current.set_nodeNumber(11);											// Set node number to 11
 		}
 		else if (current.get_nodeNumber() >= 11) {
-			Log.info("LoRa packet marked unconfigured: from=%u tempNode=%u", from, from);
-			current.set_tempNodeNumber(from);
-			current.set_nodeNumber(11);
+			current.set_tempNodeNumber(from);										// We need this address for the reply
+			current.set_nodeNumber(11);											// This way an unconfigured nor invalid node ends up wtih a node number of 11
 		}
 
-		if (lora_state == DATA_RPT) {
-			Log.info("LoRa route packet: processing data report from=%u", from);
-			if (!LoRA_Functions::instance().decipherDataReportGateway()) return false;
-		}
-		else if (lora_state == JOIN_REQ) {
-			Log.info("LoRa route packet: processing join request from=%u", from);
-			if (!LoRA_Functions::instance().decipherJoinRequestGateway()) return false;
-		}
-		else {
-			Log.info("LoRa packet ignored: from=%u dest=%u reason=invalid-message-flag flag=0x%02x", from, dest, messageFlag);
-			return false;
-		}
+		if (lora_state == DATA_RPT) {if(!LoRA_Functions::instance().decipherDataReportGateway()) return false;}
+		else if (lora_state == JOIN_REQ) {if(!LoRA_Functions::instance().decipherJoinRequestGateway()) return false;}
+		else {Log.info("Invalid message flag, returning"); return false;}
 
-		if (sysStatus.get_updatedFrequencyMinutes() > 0) {
-			sysStatus.set_frequencyMinutes(sysStatus.get_updatedFrequencyMinutes());
+		// At this point the message is valid and has been deciphered - now we need to send a response - if there is a change in freuqency, it is applied here
+		if (sysStatus.get_updatedFrequencyMinutes() > 0) {								// If we are to change the update frequency, we need to tell the nodes (or at least one node) about it.
+			sysStatus.set_frequencyMinutes(sysStatus.get_updatedFrequencyMinutes());// This was the temporary value from the particle function
 			sysStatus.set_updatedFrequencyMinutes(0);
 			Log.info("We are updating the publish frequency to %i minutes", sysStatus.get_frequencyMinutes());
 		}
-
-		if (lora_state == DATA_ACK) {
-			if (LoRA_Functions::instance().acknowledgeDataReportGateway()) return true;
-		}
-		else if (lora_state == JOIN_ACK) {
-			if (LoRA_Functions::instance().acknowledgeJoinRequestGateway()) return true;
-		}
-		else {
-			Log.info("LoRa packet ignored: from=%u dest=%u reason=invalid-ack-state state=%u", from, dest, lora_state);
-			return false;
-		}
+		// The response will be specific to the message type
+		if (lora_state == DATA_ACK) { if(LoRA_Functions::instance().acknowledgeDataReportGateway()) return true;}
+		else if (lora_state == JOIN_ACK) { if(LoRA_Functions::instance().acknowledgeJoinRequestGateway()) return true;}
+		else {Log.info("Invalid message flag"); return false;}
 	}
-	else {
-		if (millis() - lastListenIdleLog >= 15000) {
-			lastListenIdleLog = millis();
-			Log.info("LoRa listen idle: addr=%u no decodable packets for 15s", manager.thisAddress());
-		}
-	}
+	else LoRA_Functions::clearBuffer();
 	return false;
-#endif
+
 }
 
 // These are the receive and respond messages for data reports
@@ -482,11 +506,6 @@ bool LoRA_Functions::decipherDataReportGateway() {			// Receives the data report
 	current.set_successCount(buf[14]);
 	current.set_RSSI(buf[15] << 8 | buf[16]);				// These values are from the node based on the last successful data report
 	current.set_SNR(buf[17] << 8 | buf[18]);
-	Log.info("LoRa data report accepted: node=%u sensorType=%u hourly=%u daily=%u",
-		current.get_nodeNumber(),
-		current.get_sensorType(),
-		current.get_hourlyCount(),
-		current.get_dailyCount());
 
 	lora_state = DATA_ACK;		// Prepare to respond
 	return true;
@@ -494,14 +513,15 @@ bool LoRA_Functions::decipherDataReportGateway() {			// Receives the data report
 
 bool LoRA_Functions::acknowledgeDataReportGateway() { 		// This is a response to a data message 
 	char messageString[128];
+	const GatewayScheduleHint scheduleHint = gatewayScheduleHint();
 
 	// buf[0] - buf[1] is magic number - processed above
 	buf[2] = ((uint8_t) ((Time.now()) >> 24)); 		// Fourth byte - current time
 	buf[3] = ((uint8_t) ((Time.now()) >> 16));		// Third byte
 	buf[4] = ((uint8_t) ((Time.now()) >> 8));		// Second byte
 	buf[5] = ((uint8_t) (Time.now()));		    	// First byte			
-	buf[6] = highByte(sysStatus.get_frequencyMinutes());	// Frequency of reports set by the gateway
-	buf[7] = lowByte(sysStatus.get_frequencyMinutes());	
+	buf[6] = highByte(scheduleHint.frequencyMinutes);	// Frequency of reports set by the gateway
+	buf[7] = lowByte(scheduleHint.frequencyMinutes);	
 	// The next few bytes of the response will depend on whether the node is configured or not
 	if (current.get_nodeNumber() == 11) {			// This is a data report from an unconfigured node - need to tell it to rejoin
 		Log.info("Node %d is invalid, setting alert code to 1", current.get_nodeNumber());
@@ -532,7 +552,7 @@ bool LoRA_Functions::acknowledgeDataReportGateway() { 		// This is a response to
 		LoRA_Functions::instance().nodeUpdate(current.get_nodeNumber(), successPercent);
 
 	}
-	buf[10] = current.get_openHours();
+	buf[10] = scheduleHint.openHours;
 	buf[11] = current.get_messageCount();			// Repeat back message number
 
 	// nodeDatabase.flush(true);					// Save updates to the nodID database
@@ -540,14 +560,12 @@ bool LoRA_Functions::acknowledgeDataReportGateway() { 		// This is a response to
 	digitalWrite(BLUE_LED,HIGH);			       	// Sending data
 
 	byte nodeAddress = (current.get_tempNodeNumber() == 0) ? current.get_nodeNumber() : current.get_tempNodeNumber();  // get the return address right
-	Log.info("LoRa ACK send: type=data node=%u addr=%u", current.get_nodeNumber(), nodeAddress);
 
 	if (manager.sendtoWait(buf, 12, nodeAddress, DATA_ACK) == RH_ROUTER_ERROR_NONE) {
 		digitalWrite(BLUE_LED,LOW);
-		Log.info("LoRa DATA_RPT ACK sent: node=%u addr=%u alert=%u", current.get_nodeNumber(), nodeAddress, current.get_alertCodeNode());
 
-		snprintf(messageString,sizeof(messageString),"Node %d data report %d acknowledged with alert %d, and RSSI / SNR of %d / %d", current.get_nodeNumber(), buf[10], buf[8], current.get_RSSI(), current.get_SNR());
-		Log.info(messageString);
+		snprintf(messageString,sizeof(messageString),"Node %d data report %d acknowledged with alert %d, next window %s in %u minutes, and RSSI / SNR of %d / %d", current.get_nodeNumber(), buf[11], buf[8], buf[10] ? "open" : "closed", (unsigned)((buf[6] << 8) | buf[7]), current.get_RSSI(), current.get_SNR());
+		Log.info("%s", messageString);
 		if (Particle.connected()) Particle.publish("status", messageString,PRIVATE);
 		return true;
 	}
@@ -584,6 +602,7 @@ bool LoRA_Functions::decipherJoinRequestGateway() {			// Ths only question here 
 
 bool LoRA_Functions::acknowledgeJoinRequestGateway() {
 	char messageString[128];
+	const GatewayScheduleHint scheduleHint = gatewayScheduleHint();
 	Log.info("Acknowledge Join Request");
 	// This is a response to a data message and a specific payload and message flag
 	// Send a reply back to the originator client
@@ -594,8 +613,8 @@ bool LoRA_Functions::acknowledgeJoinRequestGateway() {
 	buf[3] = ((uint8_t) ((Time.now()) >> 16));						// Third byte
 	buf[4] = ((uint8_t) ((Time.now()) >> 8));						// Second byte
 	buf[5] = ((uint8_t) (Time.now()));		    					// First byte		
-	buf[6] = highByte(sysStatus.get_frequencyMinutes());			// Frequency of reports - for Gateways
-	buf[7] = lowByte(sysStatus.get_frequencyMinutes());	
+	buf[6] = highByte(scheduleHint.frequencyMinutes);			// Frequency of reports - for Gateways
+	buf[7] = lowByte(scheduleHint.frequencyMinutes);	
 	buf[8] = (current.get_nodeNumber() != 11) ?  0 : 1;				// Clear the alert code for the node unless the nodeNumber process failed
 	buf[9] = current.get_nodeNumber();								
 	buf[10] = current.get_sensorType();								// In a join request the node type overwrites the node database value
@@ -606,13 +625,12 @@ bool LoRA_Functions::acknowledgeJoinRequestGateway() {
 	byte nodeAddress = (current.get_tempNodeNumber() == 0) ? current.get_nodeNumber() : current.get_tempNodeNumber();  // get the return address right
 
 	Log.info("Sending response to %d with free memory = %li", nodeAddress, System.freeMemory());
-	Log.info("LoRa ACK send: type=join node=%u addr=%u", current.get_nodeNumber(), nodeAddress);
 
 	if (manager.sendtoWait(buf, 11, nodeAddress, JOIN_ACK) == RH_ROUTER_ERROR_NONE) {
 		current.set_tempNodeNumber(0);								// Temp no longer needed
 		digitalWrite(BLUE_LED,LOW);
 		snprintf(messageString,sizeof(messageString),"Node %d joined with sensorType %s, alert %d and RSSI / SNR of %d / %d", nodeAddress, (buf[10] ==0)? "car":"person",current.get_alertCodeNode(), current.get_RSSI(), current.get_SNR());
-		Log.info(messageString);
+		Log.info("%s", messageString);
 		if (Particle.connected()) Particle.publish("status", messageString,PRIVATE);
 		return true;
 	}
@@ -690,7 +708,7 @@ uint8_t LoRA_Functions::findNodeNumber(const char* deviceID, int radioID) {
 		mod.finishObjectOrArray();
 	mod.finish();
 
-	nodeDatabase.set_nodeIDJson(jp.getBuffer());									// This should backup the nodeID database - now updated to persistent storage
+	nodeDatabase.saveNodeIDJson(jp.getBuffer());									// This should backup the nodeID database - now updated to persistent storage
 
 	return index;
 }
@@ -755,7 +773,7 @@ bool LoRA_Functions::nodeUpdate(int nodeNumber, float successPercent)  {
 	mod.insertValue((float)successPercent);
 	mod.finish();
 
-	nodeDatabase.set_nodeIDJson(jp.getBuffer());									// This should backup the nodeID database - now updated to persistent storage
+	nodeDatabase.saveNodeIDJson(jp.getBuffer());									// This should backup the nodeID database - now updated to persistent storage
 	return true;
 }
 
@@ -803,7 +821,7 @@ bool LoRA_Functions::changeType(int nodeNumber, int newType) {
 	mod.insertValue((int)newType);
 	mod.finish();
 
-	nodeDatabase.set_nodeIDJson(jp.getBuffer());									// This should backup the nodeID database - now updated to persistent storage
+	nodeDatabase.saveNodeIDJson(jp.getBuffer());									// This should backup the nodeID database - now updated to persistent storage
 
 	return true;
 
@@ -851,7 +869,7 @@ bool LoRA_Functions::changeAlert(int nodeNumber, int newAlert) {
 	mod.insertValue((int)newAlert);
 	mod.finish();
 
-	nodeDatabase.set_nodeIDJson(jp.getBuffer());									// This updates the JSON object but doe not commit to to persistent storage
+	nodeDatabase.saveNodeIDJson(jp.getBuffer());									// This updates the JSON object and commits it to persistent storage
 
 	return true;
 }
@@ -867,11 +885,7 @@ void LoRA_Functions::printNodeData(bool publish) {
 	char data[256];
 
 	const JsonParserGeneratorRK::jsmntok_t *nodesArrayContainer;			// Token for the outer array
-	const JsonParserGeneratorRK::jsmntok_t *outerObject = jp.getOuterObject();
-	if (outerObject == NULL || !jp.getValueTokenByKey(outerObject, "nodes", nodesArrayContainer) || nodesArrayContainer == NULL) {
-		Log.warn("NodeID report unavailable - nodes array missing or invalid");
-		return;
-	}
+	jp.getValueTokenByKey(jp.getOuterObject(), "nodes", nodesArrayContainer);
 	const JsonParserGeneratorRK::jsmntok_t *nodeObjectContainer;			// Token for the objects in the array (I beleive)
 
 	for (int i=0; i<10; i++) {												// Iterate through the array looking for a match
@@ -887,7 +901,7 @@ void LoRA_Functions::printNodeData(bool publish) {
 		jp.getValueByKey(nodeObjectContainer, "succ", successPercent);
 		jp.getValueByKey(nodeObjectContainer, "pend", pendingAlert);
 
-		formatNodeHealthLine(data, sizeof(data), nodeNumber, nodeDeviceID, (time_t)lastConnect, successPercent, pendingAlert);
+		snprintf(data, sizeof(data), "Node %d, deviceID: %s, checksum %d, lastConnected: %s, type %d, success %4.2f with pending alert %d", nodeNumber, nodeDeviceID.c_str(), radioID, Time.timeStr(lastConnect).c_str(), sensorType, successPercent, pendingAlert);
 		Log.info("%s", data);
 		if (Particle.connected() && publish) {
 			Particle.publish("nodeData", data, PRIVATE);

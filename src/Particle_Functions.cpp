@@ -5,6 +5,7 @@
 #include "Particle_Functions.h"
 #include "LoRA_Functions.h"
 #include "JsonParserGeneratorRK.h"
+#include "GatewayPlatform.h"
 
 char openTimeStr[8] = " ";
 char closeTimeStr[8] = " ";
@@ -12,10 +13,20 @@ char closeTimeStr[8] = " ";
 
 // Prototypes and System Mode calls
 SYSTEM_MODE(SEMI_AUTOMATIC);                        // This will enable user code to start executing automatically.
-SYSTEM_THREAD(ENABLED);                             // Means my code will not be held up by Particle processes.
 STARTUP(System.enableFeature(FEATURE_RESET_INFO));
 
-SerialLogHandler logHandler(LOG_LEVEL_INFO);     // Easier to see the program flow
+#if VERBOSE_SYSTEM_LOGS
+SerialLogHandler logHandler(LOG_LEVEL_INFO);     // Full system verbosity for soak diagnostics
+#else
+SerialLogHandler logHandler(LOG_LEVEL_WARN, {
+  { "app", LOG_LEVEL_INFO },
+  { "system", LOG_LEVEL_WARN },
+  { "comm", LOG_LEVEL_ERROR },
+  { "net", LOG_LEVEL_ERROR },
+  { "hal", LOG_LEVEL_ERROR },
+  { "ncp", LOG_LEVEL_ERROR }
+});
+#endif
 
 Particle_Functions *Particle_Functions::_instance;
 
@@ -34,16 +45,13 @@ Particle_Functions::~Particle_Functions() {
 }
 
 void Particle_Functions::setup() {
-    Log.info("Initializing Particle functions and variables");     // Note: Don't have to be connected but these functions need to in first 30 seconds
+  SYSTEM_VERBOSE_LOG("Initializing Particle functions and variables");     // Note: Don't have to be connected but these functions need to in first 30 seconds
     Particle.function("Commands", &Particle_Functions::jsonFunctionParser, this);
 }
 
 
 void Particle_Functions::loop() {
-  if (pendingNodeDataReport) {
-    pendingNodeDataReport = false;
-    LoRA_Functions::instance().printNodeData(true);
-  }
+    // Put your code to run during the application thread loop here
 }
 
 int Particle_Functions::jsonFunctionParser(String command) {
@@ -59,7 +67,7 @@ int Particle_Functions::jsonFunctionParser(String command) {
 
 	JsonParserStatic<1024, 80> jp;	// Global parser that supports up to 256 bytes of data and 20 tokens
 
-  Log.info(command.c_str());
+  Log.info("%s", command.c_str());
 
 	jp.clear();
 	jp.addString(command);
@@ -89,7 +97,6 @@ int Particle_Functions::jsonFunctionParser(String command) {
 		if (function == "reset") {
       // Format - function - reset, node - nodeNumber, variables - either "current", "all" or "nodeData"
       // Test - {"cmd":[{"node":1,"var":"all","fn":"reset"}]}
-      // Reset Node Data - {"cmd":[{"node":0,"var":"nodeData","fn":"reset"}]}
       if (nodeNumber == 0) {
         if (variable == "nodeData") {
           snprintf(messaging,sizeof(messaging),"Resetting the gateway's node Data");
@@ -153,8 +160,8 @@ int Particle_Functions::jsonFunctionParser(String command) {
     else if (function == "rpt") {
       // Format - function - rpt, node - 0, variables - NA
       // Test - {"cmd":[{"node":0,"var":" ","fn":"rpt"}]}
-      snprintf(messaging,sizeof(messaging),"Queued nodeID Data report");
-      pendingNodeDataReport = true;
+      snprintf(messaging,sizeof(messaging),"Printing nodeID Data");
+      LoRA_Functions::instance().printNodeData(true);
     }
     // Setting Open and close hours
     else if (function == "open") {
@@ -233,7 +240,7 @@ int Particle_Functions::jsonFunctionParser(String command) {
       success = false;
     }
 
-    Log.info(messaging);
+    Log.info("%s", messaging);
     if (Particle.connected()) Particle.publish("cmd",messaging,PRIVATE);
 	}
 	return success;
@@ -242,40 +249,5 @@ int Particle_Functions::jsonFunctionParser(String command) {
 bool Particle_Functions::disconnectFromParticle()                      // Ensures we disconnect cleanly from Particle
                                                                        // Updated based on this thread: https://community.particle.io/t/waitfor-particle-connected-timeout-does-not-time-out/59181
 {
-  time_t startTime = Time.now();
-  Log.info("In the disconnect from Particle function");
-  Particle.disconnect();                                               // Disconnect from Particle
-  waitForNot(Particle.connected, 15000);                               // Up to a 15 second delay() 
-  Particle.process();
-  if (Particle.connected()) {                      // As this disconnect from Particle thing can be a·syn·chro·nous, we need to take an extra step to wait, 
-    Log.info("Failed to disconnect from Particle");
-    return(false);
-  }
-  else Log.info("Disconnected from Particle in %i seconds", (int)(Time.now() - startTime));
-  startTime = Time.now();
-  #if HAL_PLATFORM_CELLULAR
-    Cellular.disconnect();                                             // Disconnect from the cellular network
-    Cellular.off();                                                    // Turn off the cellular modem
-    waitFor(Cellular.isOff, 30000);                                    // As per TAN004: https://support.particle.io/hc/en-us/articles/1260802113569-TAN004-Power-off-Recommendations-for-SARA-R410M-Equipped-Devices
-    Particle.process();
-    if (Cellular.isOn()) {                                             // At this point, if cellular is not off, we have a problem
-      Log.info("Failed to turn off the cellular modem");
-      return(false);
-    }
-    Log.info("Turned off the cellular modem in %i seconds", (int)(Time.now() - startTime));
-    return true;
-  #elif HAL_PLATFORM_WIFI
-    WiFi.disconnect();
-    WiFi.off();
-    waitFor(WiFi.isOff, 30000);
-    Particle.process();
-    if (WiFi.isOn()) {
-      Log.info("Failed to turn off WiFi");
-      return(false);
-    }
-    Log.info("Turned off WiFi in %i seconds", (int)(Time.now() - startTime));
-    return true;
-  #else
-    return true;
-  #endif
+  return disconnectNetworkForSleep();
 }

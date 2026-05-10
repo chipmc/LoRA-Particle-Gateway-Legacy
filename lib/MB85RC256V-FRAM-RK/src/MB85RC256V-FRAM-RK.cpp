@@ -55,7 +55,7 @@ bool MB85RC::readData(size_t framAddr, uint8_t *data, size_t dataLen) {
 			wire.write(framAddr);
 			int stat = wire.endTransmission(false);
 			if (stat != 0) {
-				//Serial.printlnf("read set address failed %d", stat);
+				Log.error("FRAM read set address failed stat=%d addr=%u", stat, (unsigned)framAddr);
 				result = false;
 				break;
 			}
@@ -68,6 +68,7 @@ bool MB85RC::readData(size_t framAddr, uint8_t *data, size_t dataLen) {
 			wire.requestFrom((uint8_t)(addr | DEVICE_ADDR), bytesToRead, (uint8_t) true);
 
 			if (Wire.available() < (int) bytesToRead) {
+				Log.error("FRAM read short count=%u available=%d addr=%u", (unsigned)bytesToRead, Wire.available(), (unsigned)framAddr);
 				result = false;
 				break;
 			}
@@ -101,7 +102,7 @@ bool MB85RC::writeData(size_t framAddr, const uint8_t *data, size_t dataLen) {
 
 			int stat = wire.endTransmission(true);
 			if (stat != 0) {
-				//Serial.printlnf("write failed %d", stat);
+				Log.error("FRAM write failed stat=%d addr=%u", stat, (unsigned)framAddr);
 				result = false;
 				break;
 			}

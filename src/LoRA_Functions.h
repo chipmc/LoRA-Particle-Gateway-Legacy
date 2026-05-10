@@ -29,26 +29,26 @@ buf[17-18] SNR                              // From the Node's perspective
 /*    
     buf[0 - 1 ] magicNumber                 // Magic Number
     buf[2 - 5 ] Time.now()                  // Set the time 
-    buf[6 - 7] frequencyMinutes             // For the Gateway minutes on the hour
+    buf[6 - 7] frequencyMinutes             // Gateway scheduling hint for the node's next wake interval
     buf[8] alertCode                        // This lets the Gateway trigger an alert on the node - typically a join request
     buf[9] sensorType                       // Let's the Gateway reset the sensor if needed 
-    buf[10] openHours                        // From the Gateway to the node - is the park open?
+    buf[10] openHours                        // From the Gateway to the node - should the next node window be treated as open?
     buf[11] message number                  // Parrot this back to see if it matches
 */
 
 // Format of a join request
 /*
 buf[0-1] magicNumber;                       // Magic Number
-buf[2 - 3] nodeID                            // nodeID for verification
+buf[2 - 3] nodeID                           // nodeID for verification
 buf[4- 28] Particle deviceID;               // deviceID is unique to the device
-buf[29] sensorType				            // Identifies sensor type to Gateway
+buf[29] sensorType			        // Identifies sensor type to Gateway
 */
 
 // Format for a join acknowledgement
 /*
     buf[0 - 1 ]  magicNumber                // Magic Number
     buf[2 - 5 ] Time.now()                  // Set the time 
-    buf[6 - 7] frequencyMinutes             // For the Gateway minutes on the hour  
+    buf[6 - 7] frequencyMinutes             // Gateway scheduling hint for the node's next wake interval  
     buf[8] alertCodeNode                   // Gateway can set an alert code here
     buf[9]  newNodeNumber                   // New Node Number for device
     buf[10]  sensorType				        // Gateway confirms sensor type
@@ -111,9 +111,24 @@ public:
     void sleepLoRaRadio();
 
     /**
-     * @brief Wake the LoRa radio and ensure RX mode is active.
+     * @brief Log gateway radio state at LoRA_STATE entry.
      */
-    void wakeLoRaRadio();
+    void logGatewayStateEntry();
+
+    /**
+     * @brief Attach the gateway DIO0 diagnostic ISR wrapper after radio setup.
+     */
+    void attachGatewayDio0DiagnosticInterrupt();
+
+    /**
+     * @brief Log DIO0 setup state around gateway LoRa initialization.
+     */
+    void logGatewayDio0Setup(const char *context);
+
+    /**
+     * @brief Log the current DIO0 and RX-path snapshot while in LoRA_STATE.
+     */
+    void logGatewayDio0Snapshot();
 
     /**
      * @brief Initialize the LoRA radio

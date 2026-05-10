@@ -70,7 +70,7 @@ bool getExternalPowerPresentForDiagnostics();          // External/input power p
  * @details Provides data on the signal strength and quality
  * 
  */
-void getSignalStrength();
+void logSignalStrength();
 
 /**
  * @brief This function is called once a hardware interrupt is triggered by the device's sensor

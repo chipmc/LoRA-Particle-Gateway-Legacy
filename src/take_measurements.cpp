@@ -1,121 +1,35 @@
-// Battery conect information - https://docs.particle.io/reference/device-os/firmware/boron/#batterystate-
-const char* batteryContext[7] = {"Unknown","Not Charging","Charging","Charged","Discharging","Fault","Diconnected"};
-
 //Particle Functions
 #include "Particle.h"
 #include "take_measurements.h"
 #include "device_pinout.h"
 #include "MyPersistentData.h"
-#include "power_management.h"
-
-#if HAL_PLATFORM_CELLULAR
-FuelGauge fuelGauge;                                // Needed to address issue with updates in low battery state
-#endif
-
-namespace {
-
-uint8_t fallbackInternalTempC() {
-  uint8_t previous = current.get_internalTempC();
-  return (previous > 0 && previous < 80) ? previous : 25;
-}
-
-int readTmp36Raw(pin_t pin) {
-  analogRead(pin);
-  delayMicroseconds(50);
-
-  const int sampleCount = 8;
-  int rawSum = 0;
-  for (int index = 0; index < sampleCount; index++) {
-    rawSum += analogRead(pin);
-    delayMicroseconds(50);
-  }
-
-  return rawSum / sampleCount;
-}
-
-uint8_t readInternalTempC() {
-  int raw = readTmp36Raw(TMP36_SENSE_PIN);
-
-  bool sensorOk = (raw > 50 && raw < 4000);
-  float tempC = tmp36TemperatureC(raw);
-
-  if (!sensorOk || tempC < 0.0f || tempC > 80.0f) {
-    uint8_t fallback = fallbackInternalTempC();
-    Log.warn("TMP36 reading invalid or out of range (tmp36=%.2f C, raw=%d, sensorOk=%s) - falling back to %uC",
-        (double)tempC, raw, sensorOk ? "true" : "false", fallback);
-    return fallback;
-  }
-
-  Log.info("TMP36 valid temp %.2fC (raw=%d) - using for battery charging limits",
-      (double)tempC, raw);
-
-  return (uint8_t)(tempC + 0.5f);
-}
-
-float readBatteryVoltage() {
-#if HAL_PLATFORM_CELLULAR
-  return fuelGauge.getVCell();
-#elif PLATFORM_ID == 32 || PLATFORM_ID == 34
-  int raw = analogRead(A6);
-  return raw / 819.2f;
-#else
-  return 0.0f;
-#endif
-}
-
-bool hasExternalPowerSource() {
-#if HAL_PLATFORM_POWER_MANAGEMENT && HAL_PLATFORM_PMIC_BQ24195
-  PMIC pmic;
-  return pmic.isPowerGood();
-#else
-  return false;
-#endif
-}
-
-void updatePowerManagementFromObservation() {
-  PowerObservation obs = {};
-  int batteryStateCode = current.get_batteryState();
-
-  obs.batterySoc = current.get_stateOfCharge();
-  obs.batteryVoltage = readBatteryVoltage();
-  obs.temperatureF = (current.get_internalTempC() * 9.0f / 5.0f) + 32.0f;
-  obs.inputPowerPresent = hasExternalPowerSource();
-  obs.batteryIsCharging = batteryStateCode == 2;
-  obs.batteryNotCharging = batteryStateCode == 1;
-  obs.batteryFault = batteryStateCode == 5;
-
-  updatePowerManagementObservation(obs);
-}
-
-}
+#include "GatewayPlatform.h"
 
 bool takeMeasurements() { 
 
+  platformPrepareBatteryMeasurement();
   #if HAL_PLATFORM_CELLULAR
-    fuelGauge.quickStart();                         // Start the fuel gauge
     softDelay(1000);                                // Give the fuel gauge time to start
   #endif
 
   // Temperature inside the enclosure
-  current.set_internalTempC(readInternalTempC());
+  current.set_internalTempC((int)tmp36TemperatureC(analogRead(TMP36_SENSE_PIN)));
 
   batteryState();
-  updatePowerManagementFromObservation();
 
-  Log.info("Battery State: %s, SOC: %2.0f%%",batteryContext[current.get_batteryState()],current.get_stateOfCharge());
+  if (isItSafeToCharge()) {
+    if (platformBatterySupported()) {
+      SYSTEM_VERBOSE_LOG("Battery State: %s, SOC: %2.0f%%, VBAT=%.2f source=%s", gatewayBatteryContext(current.get_batteryState()), current.get_stateOfCharge(), GatewayPlatform::lastBatteryTelemetry().voltage, GatewayPlatform::lastBatteryTelemetry().sourceLabel);
+    }
+  }
+  else if (platformBatterySupported()) {
+    Log.error("Power configuration error");
+  }
 
-  if (sysStatus.get_nodeNumber() == 0 ) getSignalStrength();
+  if (sysStatus.get_nodeNumber() == 0 ) logSignalStrength();
 
   return 1;
 
-}
-
-float getBatteryVoltageForDiagnostics() {
-  return readBatteryVoltage();
-}
-
-bool getExternalPowerPresentForDiagnostics() {
-  return hasExternalPowerSource();
 }
 
 
@@ -141,59 +55,13 @@ float tmp36TemperatureC (int adcValue) {
 
 
 bool batteryState() {
-  #if PLATFORM_ID == PLATFORM_BORON
-    current.set_stateOfCharge(System.batteryCharge());                 // Assign to system value
-    current.set_batteryState(System.batteryState());
-    if (current.get_stateOfCharge() > 60) return true;
-    else return false;
-  #elif PLATFORM_ID == 32 || PLATFORM_ID == 34
-    // Photon 2 / P2 do not expose Boron fuel-gauge APIs. Estimate SoC from VBAT.
-    float voltage = readBatteryVoltage();
-    double stateOfCharge = (voltage - 3.0f) * (100.0f / (4.2f - 3.0f));
-
-    if (stateOfCharge < 0.0f) {
-      stateOfCharge = 0.0f;
-    }
-    else if (stateOfCharge > 100.0f) {
-      stateOfCharge = 100.0f;
-    }
-
-    current.set_stateOfCharge(stateOfCharge);
-    current.set_batteryState(0);                                       // Unknown without PMIC/fuel gauge
-
-    if (current.get_stateOfCharge() > 60) return true;
-    else return false;
-  #else
-    current.set_stateOfCharge(0);
-    current.set_batteryState(0);
-    return true;
-  #endif
+  return platformReadBatteryState();
 }
 
 
-void getSignalStrength() {
-  char signalStr[32];
-  #if HAL_PLATFORM_CELLULAR
-    const char* radioTech[10] = {"Unknown","None","WiFi","GSM","UMTS","CDMA","LTE","IEEE802154","LTE_CAT_M1","LTE_CAT_NB1"};
-    CellularSignal sig = Cellular.RSSI();
-    auto rat = sig.getAccessTechnology();
-    float strengthPercentage = sig.getStrength();
-    float qualityPercentage = sig.getQuality();
-
-    if (strengthPercentage < 0 || qualityPercentage < 0) return;
-
-    snprintf(signalStr, sizeof(signalStr), "%s S:%2.0f%%, Q:%2.0f%% ", radioTech[rat], strengthPercentage, qualityPercentage);
-    Log.info(signalStr);
-  #elif HAL_PLATFORM_WIFI
-    WiFiSignal sig = WiFi.RSSI();
-    float strengthPercentage = sig.getStrength();
-    float qualityPercentage = sig.getQuality();
-
-    if (strengthPercentage < 0 || qualityPercentage < 0) return;
-
-    snprintf(signalStr, sizeof(signalStr), "WiFi S:%2.0f%%, Q:%2.0f%% ", strengthPercentage, qualityPercentage);
-    Log.info(signalStr);
-  #endif
+bool isItSafeToCharge()                             // Returns a true or false if the battery is in a safe charging range.
+{
+  return platformApplyChargePolicy(current.get_internalTempC());
 }
 
 
