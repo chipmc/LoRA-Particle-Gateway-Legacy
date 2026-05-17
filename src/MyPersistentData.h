@@ -11,6 +11,17 @@
 #define sysStatus sysStatusData::instance()
 #define nodeDatabase nodeIDData::instance()
 
+struct NodeDbPersistStats {
+	uint32_t saveCount;
+	uint32_t totalMs;
+	uint16_t maxMs;
+	uint16_t lastMs;
+	uint16_t lastMirrorMs;
+	uint32_t dailySaveCount;
+	uint32_t dailyBytesWritten;
+	uint16_t dailyMaxSavesPerMinute;
+};
+
 /**
  * This class is a singleton; you do not create one as a global, on the stack, or with new.
  * 
@@ -529,6 +540,7 @@ public:
 	size_t get_nodeIDJsonLength() const;
 	bool set_nodeIDJson(const char *str);
 	bool saveNodeIDJson(const char *str, bool force = true);
+	NodeDbPersistStats getPersistStats() const;
 	virtual bool load() override;
 	virtual void save() override;
 	
@@ -569,6 +581,12 @@ protected:
 	static const uint16_t NODEID_DATA_VERSION = 2;
 	static const int NODEID_PRIMARY_OFFSET = 200;
 	static const int NODEID_BACKUP_OFFSET = NODEID_PRIMARY_OFFSET + sizeof(NodeData);
+	NodeDbPersistStats persistStatsData = {};
+	time_t persistDayWindowStart = 0;
+	time_t persistMinuteBucket = 0;
+	uint16_t persistSavesThisMinute = 0;
+	void recordPersistSave(uint32_t mirrorDurationMs, uint32_t totalDurationMs);
+	void maybeLogPersist24h();
 
 };
 

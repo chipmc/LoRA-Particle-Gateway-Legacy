@@ -56,7 +56,8 @@ volatile uint32_t loraDio0InterruptCount = 0;
 
 const uint8_t GATEWAY_TX_POWER_DBM = 23;
 const uint16_t GATEWAY_MANAGER_TIMEOUT_MS = 2000;
-const RH_RF95::ModemConfigChoice GATEWAY_MODEM_CONFIG = RH_RF95::Bw125Cr45Sf2048;
+// Exact Bw125Cr45Sf2048 register triplet from the local RH_RF95 modem table.
+const RH_RF95::ModemConfig GATEWAY_MODEM_CONFIG = {0x72, 0xb4, 0x04};
 const char *const GATEWAY_MODEM_CONFIG_NAME = "Bw125Cr45Sf2048";
 const char *const RADIOHEAD_GIT_DIFF_STATUS = "build-source git diff clean for RadioHead/RH_RF95/RHMesh/RHDatagram";
 
@@ -64,8 +65,19 @@ void loraDio0DiagnosticISR();
 
 namespace {
 
+const uint32_t PRE_ACK_PERSIST_WARN_MS = 25;
+const uint32_t PRE_ACK_PERSIST_STRONG_WARN_MS = 50;
+const uint32_t PRE_ACK_PERSIST_CRITICAL_MS = 100;
+
 const char *const NODE_DB_BAD_PATH = "/usr/nodedb.bad";
 const char *const NODE_DB_BAD_TMP_PATH = "/usr/nodedb.bad.tmp";
+
+struct PersistSnapshot {
+	uint32_t saveCount;
+	uint32_t totalMs;
+	uint16_t lastMs;
+	uint16_t lastMirrorMs;
+};
 
 struct GatewayScheduleHint {
 	uint16_t frequencyMinutes;
@@ -157,6 +169,29 @@ GatewayScheduleHint gatewayScheduleHint() {
 		return {minutesUntilNextOpening(), false};
 	}
 	return {sysStatus.get_frequencyMinutes(), true};
+}
+
+PersistSnapshot capturePersistSnapshot() {
+	const NodeDbPersistStats stats = nodeDatabase.getPersistStats();
+	return {stats.saveCount, stats.totalMs, stats.lastMs, stats.lastMirrorMs};
+}
+
+void logPersistWindow(const char *context, uint32_t elapsedMs, const PersistSnapshot &before) {
+	const PersistSnapshot after = capturePersistSnapshot();
+	const uint32_t saveDelta = after.saveCount - before.saveCount;
+	if (saveDelta == 0) {
+		return;
+	}
+
+	if (elapsedMs > PRE_ACK_PERSIST_CRITICAL_MS || saveDelta > 1) {
+		Log.error("PersistCrit: ctx=%s preAck=%lums saves=%lu save=%ums mirror=%ums", context, (unsigned long)elapsedMs, (unsigned long)saveDelta, after.lastMs, after.lastMirrorMs);
+	}
+	else if (elapsedMs > PRE_ACK_PERSIST_STRONG_WARN_MS) {
+		Log.warn("PersistWarn: ctx=%s preAck=%lums saves=%lu save=%ums mirror=%ums", context, (unsigned long)elapsedMs, (unsigned long)saveDelta, after.lastMs, after.lastMirrorMs);
+	}
+	else if (elapsedMs > PRE_ACK_PERSIST_WARN_MS) {
+		Log.warn("Persist: ctx=%s preAck=%lums saves=%lu save=%ums mirror=%ums", context, (unsigned long)elapsedMs, (unsigned long)saveDelta, after.lastMs, after.lastMirrorMs);
+	}
 }
 
 } // anonymous namespace
@@ -309,7 +344,7 @@ bool LoRA_Functions::setup(bool gatewayID) {
 	if (gatewayID == true) {
 		sysStatus.set_nodeNumber(GATEWAY_ADDRESS);							// Gateway - Manager is initialized by default with GATEWAY_ADDRESS - make sure it is stored in FRAM
 		Log.info("LoRA Radio initialized as a gateway (address %d) with a deviceID of %s", GATEWAY_ADDRESS, System.deviceID().c_str());
-		LORA_DIAG_LOG("LoRa diag setup: addr=%u freq=%.2f modem=%d/%s timeout=%u tx=%u pins cs=%d irq=%d rst=%d", manager.thisAddress(), RF95_FREQ, (int)GATEWAY_MODEM_CONFIG, GATEWAY_MODEM_CONFIG_NAME, GATEWAY_MANAGER_TIMEOUT_MS, GATEWAY_TX_POWER_DBM, (int)RFM95_CS, (int)RFM95_INT, (int)RFM95_RST);
+		LORA_DIAG_LOG("LoRa diag setup: addr=%u freq=%.2f modem=%s regs=%02x/%02x/%02x timeout=%u tx=%u pins cs=%d irq=%d rst=%d", manager.thisAddress(), RF95_FREQ, GATEWAY_MODEM_CONFIG_NAME, GATEWAY_MODEM_CONFIG.reg_1d, GATEWAY_MODEM_CONFIG.reg_1e, GATEWAY_MODEM_CONFIG.reg_26, GATEWAY_MANAGER_TIMEOUT_MS, GATEWAY_TX_POWER_DBM, (int)RFM95_CS, (int)RFM95_INT, (int)RFM95_RST);
 		LORA_DIAG_LOG("LoRa diag setup: rh_rf95_version=0x%02x source_check=%s", driver.getDeviceVersion(), RADIOHEAD_GIT_DIFF_STATUS);
 	}
 	else if (sysStatus.get_nodeNumber() > 0 && sysStatus.get_nodeNumber() <= 10) {
@@ -422,8 +457,7 @@ bool  LoRA_Functions::initializeRadio() {  			// Set up the Radio Module
 	}
 	driver.setFrequency(RF95_FREQ);					// Frequency is typically 868.0 or 915.0 in the Americas, or 433.0 in the EU - Are there more settings possible here?
 	driver.setTxPower(GATEWAY_TX_POWER_DBM, false); // If you are using RFM95/96/97/98 modules which uses the PA_BOOST transmitter pin, then you can set transmitter powers from 5 to 23 dBm (13dBm default).  PA_BOOST?
-	driver.setModemConfig(GATEWAY_MODEM_CONFIG);
-	//driver.setModemConfig(RH_RF95::Bw125Cr48Sf4096);	// This optimized the radio for long range - https://www.airspayce.com/mikem/arduino/RadioHead/classRH__RF95.html
+	driver.setModemRegisters(&GATEWAY_MODEM_CONFIG);
 	driver.setLowDatarate();						// https://www.airspayce.com/mikem/arduino/RadioHead/classRH__RF95.html#a8e2df6a6d2cb192b13bd572a7005da67
 	manager.setTimeout(GATEWAY_MANAGER_TIMEOUT_MS);			// 200mSec is the default - may need to extend once we play with other settings on the modem - https://www.airspayce.com/mikem/arduino/RadioHead/classRHReliableDatagram.html
 return true;
@@ -514,6 +548,9 @@ bool LoRA_Functions::decipherDataReportGateway() {			// Receives the data report
 bool LoRA_Functions::acknowledgeDataReportGateway() { 		// This is a response to a data message 
 	char messageString[128];
 	const GatewayScheduleHint scheduleHint = gatewayScheduleHint();
+	byte pendingAlert = 0;
+	bool clearPendingAlert = false;
+	float successPercent = 0.0f;
 
 	// buf[0] - buf[1] is magic number - processed above
 	buf[2] = ((uint8_t) ((Time.now()) >> 24)); 		// Fourth byte - current time
@@ -531,7 +568,8 @@ bool LoRA_Functions::acknowledgeDataReportGateway() { 		// This is a response to
 		buf[9] = current.get_sensorType();			// Since the node is unconfigured, we need to beleive it when it tells us the type
 	}
 	else {											// This is a data report from a configured node - will use the node database
-		current.set_alertCodeNode(LoRA_Functions::getAlert(current.get_nodeNumber()));
+		pendingAlert = LoRA_Functions::getAlert(current.get_nodeNumber());
+		current.set_alertCodeNode(pendingAlert);
 		if (current.get_alertCodeNode() > 0) Log.info("Node %d has a pending alert %d", current.get_nodeNumber(), current.get_alertCodeNode());
 	
 		if (current.get_alertCodeNode() == 7) {		// if it is a change in type alert - we can do that here
@@ -542,15 +580,11 @@ bool LoRA_Functions::acknowledgeDataReportGateway() { 		// This is a response to
 		}
 		else buf[9] = current.get_sensorType();
 
-		if (current.get_alertCodeNode() != 0) LoRA_Functions::changeAlert(current.get_nodeNumber(),0); 	// The alert was serviced or applied - no longer pending
+		clearPendingAlert = (current.get_alertCodeNode() != 0);
 		buf[8] = current.get_alertCodeNode();
 
-		// At this point we can update the last connection time in the node database
-		float successPercent;
 		if (current.get_messageCount()==0) successPercent = 0.0;
 		else successPercent = ((current.get_successCount()+1.0)/(float)current.get_messageCount()) * 100.0;  // Add one to success because we are receving the message
-		LoRA_Functions::instance().nodeUpdate(current.get_nodeNumber(), successPercent);
-
 	}
 	buf[10] = scheduleHint.openHours;
 	buf[11] = current.get_messageCount();			// Repeat back message number
@@ -563,6 +597,16 @@ bool LoRA_Functions::acknowledgeDataReportGateway() { 		// This is a response to
 
 	if (manager.sendtoWait(buf, 12, nodeAddress, DATA_ACK) == RH_ROUTER_ERROR_NONE) {
 		digitalWrite(BLUE_LED,LOW);
+
+		if (current.get_nodeNumber() != 11) {
+			const system_tick_t persistStart = millis();
+			const PersistSnapshot beforePersist = capturePersistSnapshot();
+			if (clearPendingAlert) {
+				LoRA_Functions::changeAlert(current.get_nodeNumber(), 0, false);
+			}
+			LoRA_Functions::instance().nodeUpdate(current.get_nodeNumber(), successPercent, true);
+			logPersistWindow("dataAckPost", millis() - persistStart, beforePersist);
+		}
 
 		snprintf(messageString,sizeof(messageString),"Node %d data report %d acknowledged with alert %d, next window %s in %u minutes, and RSSI / SNR of %d / %d", current.get_nodeNumber(), buf[11], buf[8], buf[10] ? "open" : "closed", (unsigned)((buf[6] << 8) | buf[7]), current.get_RSSI(), current.get_SNR());
 		Log.info("%s", messageString);
@@ -580,6 +624,8 @@ bool LoRA_Functions::acknowledgeDataReportGateway() { 		// This is a response to
 // These are the receive and respond messages for join requests
 bool LoRA_Functions::decipherJoinRequestGateway() {			// Ths only question here is whether the node with the join request needs a new nodeNumber or is just looking for a clock set
 	char nodeDeviceID[25];
+	const system_tick_t persistStart = millis();
+	const PersistSnapshot beforePersist = capturePersistSnapshot();
 	// buf[0] - buf[1] Magic number processed above
 	// but[2] - buf[3] nodeID processed above
 	// buf[4] - buf[28] needs to be loaded here
@@ -587,14 +633,15 @@ bool LoRA_Functions::decipherJoinRequestGateway() {			// Ths only question here 
 		nodeDeviceID[i] = buf[i+4];
 	}
 	current.set_sensorType(buf[29]);								// Store device type in the current data buffer 
-	current.set_nodeNumber(findNodeNumber(nodeDeviceID,current.get_nodeID()));		// Look up the new node number
+	current.set_nodeNumber(findNodeNumber(nodeDeviceID, current.get_nodeID(), false));		// Look up the new node number
 	
 	Log.info("Node %d join request from %s will change node number to %d", current.get_tempNodeNumber(), nodeDeviceID ,current.get_nodeNumber());
 
 	current.set_alertCodeNode(1);									// This is a join request so alert code is 1
 	current.set_alertTimestampNode(Time.now());
 
-	LoRA_Functions::changeType(current.get_nodeNumber(),current.get_sensorType());  // Record the sensor type in the nodeID structure
+	LoRA_Functions::changeType(current.get_nodeNumber(), current.get_sensorType(), true);  // Record the sensor type in the nodeID structure
+	logPersistWindow("joinPreAck", millis() - persistStart, beforePersist);
 
 	lora_state = JOIN_ACK;			// Prepare to respond
 	return true;
@@ -662,7 +709,7 @@ bool LoRA_Functions::acknowledgeJoinRequestGateway() {
 
 
 // These functions access data in the nodeID JSON
-uint8_t LoRA_Functions::findNodeNumber(const char* deviceID, int radioID) {
+uint8_t LoRA_Functions::findNodeNumber(const char* deviceID, int radioID, bool persistNow) {
 	int index=1;															// Variables to hold values for the function
 	String nodeDeviceID;
 	int nodeNumber;
@@ -708,7 +755,9 @@ uint8_t LoRA_Functions::findNodeNumber(const char* deviceID, int radioID) {
 		mod.finishObjectOrArray();
 	mod.finish();
 
-	nodeDatabase.saveNodeIDJson(jp.getBuffer());									// This should backup the nodeID database - now updated to persistent storage
+	if (persistNow) {
+		nodeDatabase.saveNodeIDJson(jp.getBuffer());
+	}
 
 	return index;
 }
@@ -751,7 +800,7 @@ bool LoRA_Functions::nodeConfigured(int nodeNumber, int radioID)  {
 	}
 }
 
-bool LoRA_Functions::nodeUpdate(int nodeNumber, float successPercent)  {
+bool LoRA_Functions::nodeUpdate(int nodeNumber, float successPercent, bool persistNow)  {
 
 	const JsonParserGeneratorRK::jsmntok_t *nodesArrayContainer;			// Token for the outer array
 	jp.getValueTokenByKey(jp.getOuterObject(), "nodes", nodesArrayContainer);
@@ -773,7 +822,9 @@ bool LoRA_Functions::nodeUpdate(int nodeNumber, float successPercent)  {
 	mod.insertValue((float)successPercent);
 	mod.finish();
 
-	nodeDatabase.saveNodeIDJson(jp.getBuffer());									// This should backup the nodeID database - now updated to persistent storage
+	if (persistNow) {
+		nodeDatabase.saveNodeIDJson(jp.getBuffer());
+	}
 	return true;
 }
 
@@ -795,7 +846,7 @@ byte LoRA_Functions::getType(int nodeNumber) {
 	return type;
 }
 
-bool LoRA_Functions::changeType(int nodeNumber, int newType) {
+bool LoRA_Functions::changeType(int nodeNumber, int newType, bool persistNow) {
 	if (nodeNumber > 10) return false;
 	int type;
 
@@ -807,6 +858,9 @@ bool LoRA_Functions::changeType(int nodeNumber, int newType) {
 	if(nodeObjectContainer == NULL) return false;								// Ran out of entries 
 
 	jp.getValueByKey(nodeObjectContainer, "type", type);
+	if (type == newType) {
+		return true;
+	}
 
 	Log.info("Changing sensor type from %d to %d", type, newType);
 
@@ -821,7 +875,9 @@ bool LoRA_Functions::changeType(int nodeNumber, int newType) {
 	mod.insertValue((int)newType);
 	mod.finish();
 
-	nodeDatabase.saveNodeIDJson(jp.getBuffer());									// This should backup the nodeID database - now updated to persistent storage
+	if (persistNow) {
+		nodeDatabase.saveNodeIDJson(jp.getBuffer());
+	}
 
 	return true;
 
@@ -848,7 +904,7 @@ byte LoRA_Functions::getAlert(int nodeNumber) {
 
 }
 
-bool LoRA_Functions::changeAlert(int nodeNumber, int newAlert) {
+bool LoRA_Functions::changeAlert(int nodeNumber, int newAlert, bool persistNow) {
 	int currentAlert;
 
 	const JsonParserGeneratorRK::jsmntok_t *nodesArrayContainer;			// Token for the outer array
@@ -859,6 +915,9 @@ bool LoRA_Functions::changeAlert(int nodeNumber, int newAlert) {
 	if(nodeObjectContainer == NULL) return false;							// Ran out of entries - node number entry not found triggers alert
 
 	jp.getValueByKey(nodeObjectContainer, "pend", currentAlert);			// Now we have the oject for the specific node
+	if (currentAlert == newAlert) {
+		return true;
+	}
 	Log.info("Changing pending alert from %d to %d", currentAlert, newAlert);
 
 	const JsonParserGeneratorRK::jsmntok_t *value;							// Node we have the key value pair for the "pend"ing alerts	
@@ -869,7 +928,9 @@ bool LoRA_Functions::changeAlert(int nodeNumber, int newAlert) {
 	mod.insertValue((int)newAlert);
 	mod.finish();
 
-	nodeDatabase.saveNodeIDJson(jp.getBuffer());									// This updates the JSON object and commits it to persistent storage
+	if (persistNow) {
+		nodeDatabase.saveNodeIDJson(jp.getBuffer());
+	}
 
 	return true;
 }

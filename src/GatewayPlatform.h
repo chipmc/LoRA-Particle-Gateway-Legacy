@@ -53,8 +53,8 @@
 #define SYSTEM_VERBOSE_LOG(...) do { } while (0)
 #endif
 
-#define GATEWAY_PRODUCT_VERSION 21
-#define GATEWAY_RELEASE_STRING "21.00"
+#define GATEWAY_PRODUCT_VERSION 23
+#define GATEWAY_RELEASE_STRING "23.00"
 
 static const uint8_t GATEWAY_BATTERY_STATE_NA = 7;
 static const uint8_t GATEWAY_BATTERY_STATE_ESTIMATED = 8;

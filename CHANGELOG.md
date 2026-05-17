@@ -1,5 +1,13 @@
 # Changelog
 
+## v23.00 - 2026-05-17
+
+- Reduced Gateway NodeDB persistence overhead by coalescing duplicate saves, keeping data-report bookkeeping off the ACK hot path, and preserving mirrored FRAM durability and repair behavior.
+- Added compact persistence timing instrumentation and 24-hour write statistics so field logs can show save latency, mirrored-write cost, and burst frequency without verbose spam.
+- Kept LoRa runtime behavior unchanged while replacing the brittle RF9X preset enum dependency with the exact equivalent modem-register shim for reproducible Boron and P2 builds.
+- Preserved existing sleep/connect, watchdog, PMIC, and timing behavior while keeping release logging concise and reducing format-string truncation risk.
+- Validated full Boron and P2 production builds for release packaging.
+
 ## v21.00 - 2026-05-09
 
 - Added gateway production-hardening updates for Photon 2 / P2, including VBAT-based battery telemetry with conservative SoC estimation.

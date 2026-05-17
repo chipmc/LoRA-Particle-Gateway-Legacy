@@ -37,6 +37,7 @@
 // v10.00 - Updated the power management code to encourage charging
 // v19.00 - Dual-platform Boron/Photon 2 gateway release with platform abstraction, closed-hours scheduling, P2 pin mapping, and connection diagnostics
 // v21.00 - Gateway production hardening release with FRAM repair/verification, normalized logging, battery telemetry, safe local config handling, and boot reset diagnostics
+// v23.00 - Release finalization with NodeDB save coalescing, ACK-path persistence reduction, compact persistence instrumentation, and RF9X modem-config compatibility build fix
 
 #define DEFAULT_LORA_WINDOW 5
 #define STAY_CONNECTED 60
@@ -436,10 +437,10 @@ void publishWebhook(uint8_t nodeNumber) {
 		const GatewayBatteryTelemetry telemetry = GatewayPlatform::lastBatteryTelemetry();
 		Log.info("Gateway battery: %.0f%% %s VBAT=%.2f source=%s", telemetry.available ? telemetry.soc : 0.0f, telemetry.contextLabel, telemetry.available ? telemetry.voltage : 0.0f, telemetry.sourceLabel);
 
-		snprintf(data, sizeof(data), "{\"deviceid\":\"%s\", \"hourly\":%u, \"daily\":%u, \"sensortype\":%d, \"battery\":%4.2f,\"key1\":\"%s\",\"temp\":%d, \"resets\":%d, \"msg\":%d, \"timestamp\":%lu000}",\
-		Particle.deviceID().c_str(), 0, 0, sysStatus.get_sensorType(), current.get_stateOfCharge(), gatewayBatteryContext(current.get_batteryState()),\
-		current.get_internalTempC(), sysStatus.get_resetCount(), sysStatus.get_messageCount(), endTimePeriod);
-		PublishQueuePosix::instance().publish("Ubidots-LoRA-Gateway-v1", data, PRIVATE | WITH_ACK);
+		snprintf(data, sizeof(data), "{\"deviceid\":\"%s\", \"battery\":%4.2f,\"key1\":\"%s\",\"temp\":%d, \"resets\":%d, \"alerts\": %d, \"msg\":%d, \"connecttime\":%lu, \"timestamp\":%lu000}",\
+		Particle.deviceID().c_str(), current.get_stateOfCharge(), gatewayBatteryContext(current.get_batteryState()), current.get_internalTempC(), sysStatus.get_resetCount(),\ 
+		sysStatus.get_alertCodeGateway(), sysStatus.get_messageCount(), sysStatus.get_lastConnectionDuration(), endTimePeriod);
+		PublishQueuePosix::instance().publish("Ubidots-LoRA-Gateway-v2", data, PRIVATE | WITH_ACK);
 	}
 	return;
 }

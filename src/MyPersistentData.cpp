@@ -483,6 +483,11 @@ void currentStatusData::set_productVersion(uint16_t value) {
 namespace {
 
 const char *const EMPTY_NODE_DB_JSON = "{\"nodes\":[]}";
+const uint32_t NODE_DB_PERSIST_WARN_MS = 25;
+const uint32_t NODE_DB_PERSIST_STRONG_WARN_MS = 50;
+const uint32_t NODE_DB_PERSIST_CRITICAL_MS = 100;
+const uint32_t NODE_DB_PERSIST_DAY_SECONDS = 86400;
+const uint32_t NODE_DB_PERSIST_BYTES_PER_SAVE = sizeof(nodeIDData::NodeData) * 2;
 
 bool bufferIsFilledWith(const uint8_t *buffer, size_t length, uint8_t value) {
     for (size_t index = 0; index < length; index++) {
@@ -569,19 +574,26 @@ bool nodeIDData::load() {
 }
 
 void nodeIDData::save() {
+    const system_tick_t saveStart = millis();
+    uint32_t mirrorDurationMs = 0;
     WITH_LOCK(*this) {
+        const system_tick_t mirrorStart = millis();
         const bool backupOk = fram.writeData(NODEID_BACKUP_OFFSET, (const uint8_t *)&nodeData.nodeHeader, sizeof(NodeData));
         const bool primaryOk = fram.writeData(NODEID_PRIMARY_OFFSET, (const uint8_t *)&nodeData.nodeHeader, sizeof(NodeData));
+        mirrorDurationMs = millis() - mirrorStart;
 
         if (!backupOk || !primaryOk) {
             Log.error("NodeDB save failed: primary=%s backup=%s", primaryOk ? "ok" : "failed", backupOk ? "ok" : "failed");
         }
     }
+    const uint32_t totalDurationMs = millis() - saveStart;
+    recordPersistSave(mirrorDurationMs, totalDurationMs);
     PersistentDataBase::save();
 }
 
 void nodeIDData::loop() {
     nodeDatabase.flush(false);
+    maybeLogPersist24h();
 }
 
 bool nodeIDData::resetNodeIDs() {
@@ -688,4 +700,91 @@ bool nodeIDData::saveNodeIDJson(const char *str, bool force) {
         Log.info("NodeDB atomic save complete");
     }
     return true;
+}
+
+NodeDbPersistStats nodeIDData::getPersistStats() const {
+    NodeDbPersistStats snapshot;
+    WITH_LOCK(*this) {
+        snapshot = persistStatsData;
+    }
+    return snapshot;
+}
+
+void nodeIDData::recordPersistSave(uint32_t mirrorDurationMs, uint32_t totalDurationMs) {
+    NodeDbPersistStats snapshot;
+
+    WITH_LOCK(*this) {
+        persistStatsData.saveCount++;
+        persistStatsData.totalMs += totalDurationMs;
+        persistStatsData.lastMs = (uint16_t)min(totalDurationMs, (uint32_t)UINT16_MAX);
+        persistStatsData.lastMirrorMs = (uint16_t)min(mirrorDurationMs, (uint32_t)UINT16_MAX);
+        if (persistStatsData.lastMs > persistStatsData.maxMs) {
+            persistStatsData.maxMs = persistStatsData.lastMs;
+        }
+
+        if (Time.isValid()) {
+            const time_t now = Time.now();
+            if (persistDayWindowStart == 0) {
+                persistDayWindowStart = now;
+            }
+
+            const time_t minuteBucket = now / 60;
+            if (persistMinuteBucket != minuteBucket) {
+                persistMinuteBucket = minuteBucket;
+                persistSavesThisMinute = 0;
+            }
+            persistSavesThisMinute++;
+
+            persistStatsData.dailySaveCount++;
+            persistStatsData.dailyBytesWritten += NODE_DB_PERSIST_BYTES_PER_SAVE;
+            if (persistSavesThisMinute > persistStatsData.dailyMaxSavesPerMinute) {
+                persistStatsData.dailyMaxSavesPerMinute = persistSavesThisMinute;
+            }
+        }
+
+        snapshot = persistStatsData;
+    }
+
+    if (totalDurationMs > NODE_DB_PERSIST_CRITICAL_MS) {
+        Log.error("PersistCrit: save=%lums mirror=%lums", (unsigned long)totalDurationMs, (unsigned long)mirrorDurationMs);
+    }
+    else if (totalDurationMs > NODE_DB_PERSIST_STRONG_WARN_MS) {
+        Log.warn("PersistWarn: save=%lums mirror=%lums", (unsigned long)totalDurationMs, (unsigned long)mirrorDurationMs);
+    }
+    else if (totalDurationMs > NODE_DB_PERSIST_WARN_MS) {
+        Log.warn("Persist: save=%lums mirror=%lums", (unsigned long)totalDurationMs, (unsigned long)mirrorDurationMs);
+    }
+}
+
+void nodeIDData::maybeLogPersist24h() {
+    if (!Time.isValid()) {
+        return;
+    }
+
+    NodeDbPersistStats snapshot;
+    bool shouldLog = false;
+
+    WITH_LOCK(*this) {
+        const time_t now = Time.now();
+        if (persistDayWindowStart == 0) {
+            persistDayWindowStart = now;
+            return;
+        }
+        if ((now - persistDayWindowStart) < (time_t)NODE_DB_PERSIST_DAY_SECONDS) {
+            return;
+        }
+
+        snapshot = persistStatsData;
+        persistDayWindowStart = now;
+        persistStatsData.dailySaveCount = 0;
+        persistStatsData.dailyBytesWritten = 0;
+        persistStatsData.dailyMaxSavesPerMinute = 0;
+        persistMinuteBucket = now / 60;
+        persistSavesThisMinute = 0;
+        shouldLog = true;
+    }
+
+    if (shouldLog) {
+        Log.info("Persist24h: saves=%lu bytes=%lu maxBurst=%u max=%ums", (unsigned long)snapshot.dailySaveCount, (unsigned long)snapshot.dailyBytesWritten, snapshot.dailyMaxSavesPerMinute, snapshot.maxMs);
+    }
 }
