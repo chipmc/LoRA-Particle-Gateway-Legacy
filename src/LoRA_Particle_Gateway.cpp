@@ -427,9 +427,16 @@ void publishWebhook(uint8_t nodeNumber) {
 
 		float percentSuccess = ((current.get_successCount() * 1.0)/ current.get_messageCount())*100.0;
 
-		snprintf(data, sizeof(data), "{\"deviceid\":\"%s\", \"hourly\":%u, \"daily\":%u, \"sensortype\":%d, \"battery\":%4.2f,\"key1\":\"%s\",\"temp\":%d, \"resets\":%d,\"alerts\": %d, \"node\": %d, \"rssi\":%d,  \"snr\":%d, \"hops\":%d, \"msg\":%d, \"success\":%4.2f, \"timestamp\":%lu000}",\
-		deviceID.c_str(), current.get_hourlyCount(), current.get_dailyCount(), current.get_sensorType(), current.get_stateOfCharge(), gatewayBatteryContext(current.get_batteryState()),\
-		current.get_internalTempC(), current.get_resetCount(), current.get_alertCodeNode(), current.get_nodeNumber(), current.get_RSSI(), current.get_SNR(), current.get_hops(), current.get_messageCount(), percentSuccess, endTimePeriod);
+		snprintf(data, sizeof(data),
+			"{\"deviceid\":\"%s\", \"hourly\":%u, \"daily\":%u, \"sensortype\":%d, "
+			"\"battery\":%4.2f,\"key1\":\"%s\",\"temp\":%d, \"resets\":%d,"
+			"\"alerts\": %d, \"node\": %d, \"rssi\":%d,  \"snr\":%d, \"hops\":%d, "
+			"\"msg\":%d, \"success\":%4.2f, \"timestamp\":%lu000}",
+			deviceID.c_str(), current.get_hourlyCount(), current.get_dailyCount(), current.get_sensorType(),
+			current.get_stateOfCharge(), gatewayBatteryContext(current.get_batteryState()),
+			current.get_internalTempC(), current.get_resetCount(), current.get_alertCodeNode(), current.get_nodeNumber(),
+			current.get_RSSI(), current.get_SNR(), current.get_hops(), current.get_messageCount(), percentSuccess,
+			endTimePeriod);
 		PublishQueuePosix::instance().publish("Ubidots-LoRA-Node-v1", data, PRIVATE | WITH_ACK);
 	}
 	else {																// Webhook for the gateway
@@ -437,9 +444,12 @@ void publishWebhook(uint8_t nodeNumber) {
 		const GatewayBatteryTelemetry telemetry = GatewayPlatform::lastBatteryTelemetry();
 		Log.info("Gateway battery: %.0f%% %s VBAT=%.2f source=%s", telemetry.available ? telemetry.soc : 0.0f, telemetry.contextLabel, telemetry.available ? telemetry.voltage : 0.0f, telemetry.sourceLabel);
 
-		snprintf(data, sizeof(data), "{\"deviceid\":\"%s\", \"battery\":%4.2f,\"key1\":\"%s\",\"temp\":%d, \"resets\":%d, \"alerts\": %d, \"msg\":%d, \"connecttime\":%lu, \"timestamp\":%lu000}",\
-		Particle.deviceID().c_str(), current.get_stateOfCharge(), gatewayBatteryContext(current.get_batteryState()), current.get_internalTempC(), sysStatus.get_resetCount(),\ 
-		sysStatus.get_alertCodeGateway(), sysStatus.get_messageCount(), sysStatus.get_lastConnectionDuration(), endTimePeriod);
+		snprintf(data, sizeof(data),
+			"{\"deviceid\":\"%s\", \"battery\":%4.2f,\"key1\":\"%s\",\"temp\":%d, "
+			"\"resets\":%d, \"alerts\": %d, \"msg\":%d, \"connecttime\":%u, \"timestamp\":%lu000}",
+			Particle.deviceID().c_str(), current.get_stateOfCharge(), gatewayBatteryContext(current.get_batteryState()),
+			current.get_internalTempC(), sysStatus.get_resetCount(), sysStatus.get_alertCodeGateway(),
+			sysStatus.get_messageCount(), sysStatus.get_lastConnectionDuration(), endTimePeriod);
 		PublishQueuePosix::instance().publish("Ubidots-LoRA-Gateway-v2", data, PRIVATE | WITH_ACK);
 	}
 	return;
