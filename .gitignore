@@ -20,7 +20,7 @@ target/*
 .DS_Store
 *.crc_block
 *.no_crc
-src/config.h
+src/local_secrets.h
 
 # VisualStudioCode
 .vscode/*

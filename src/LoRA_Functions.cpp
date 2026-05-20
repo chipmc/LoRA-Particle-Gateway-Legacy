@@ -165,10 +165,24 @@ uint16_t minutesUntilNextOpening() {
 }
 
 GatewayScheduleHint gatewayScheduleHint() {
+	if (!Time.isValid()) {
+		return {sysStatus.get_frequencyMinutes(), true};
+	}
 	if (shouldSendClosedHoursHint()) {
 		return {minutesUntilNextOpening(), false};
 	}
 	return {sysStatus.get_frequencyMinutes(), true};
+}
+
+time_t gatewayAckTimestamp() {
+	return Time.isValid() ? Time.now() : 0;
+}
+
+void encodeGatewayAckTimestamp(uint8_t *payload, time_t gatewayTime) {
+	payload[2] = ((uint8_t) (gatewayTime >> 24));
+	payload[3] = ((uint8_t) (gatewayTime >> 16));
+	payload[4] = ((uint8_t) (gatewayTime >> 8));
+	payload[5] = ((uint8_t) gatewayTime);
 }
 
 PersistSnapshot capturePersistSnapshot() {
@@ -548,15 +562,13 @@ bool LoRA_Functions::decipherDataReportGateway() {			// Receives the data report
 bool LoRA_Functions::acknowledgeDataReportGateway() { 		// This is a response to a data message 
 	char messageString[128];
 	const GatewayScheduleHint scheduleHint = gatewayScheduleHint();
+	const time_t ackTime = gatewayAckTimestamp();
 	byte pendingAlert = 0;
 	bool clearPendingAlert = false;
 	float successPercent = 0.0f;
 
 	// buf[0] - buf[1] is magic number - processed above
-	buf[2] = ((uint8_t) ((Time.now()) >> 24)); 		// Fourth byte - current time
-	buf[3] = ((uint8_t) ((Time.now()) >> 16));		// Third byte
-	buf[4] = ((uint8_t) ((Time.now()) >> 8));		// Second byte
-	buf[5] = ((uint8_t) (Time.now()));		    	// First byte			
+	encodeGatewayAckTimestamp(buf, ackTime);
 	buf[6] = highByte(scheduleHint.frequencyMinutes);	// Frequency of reports set by the gateway
 	buf[7] = lowByte(scheduleHint.frequencyMinutes);	
 	// The next few bytes of the response will depend on whether the node is configured or not
@@ -604,7 +616,7 @@ bool LoRA_Functions::acknowledgeDataReportGateway() { 		// This is a response to
 			if (clearPendingAlert) {
 				LoRA_Functions::changeAlert(current.get_nodeNumber(), 0, false);
 			}
-			LoRA_Functions::instance().nodeUpdate(current.get_nodeNumber(), successPercent, true);
+			LoRA_Functions::instance().nodeUpdate(current.get_nodeNumber(), successPercent, false);
 			logPersistWindow("dataAckPost", millis() - persistStart, beforePersist);
 		}
 
@@ -640,7 +652,7 @@ bool LoRA_Functions::decipherJoinRequestGateway() {			// Ths only question here 
 	current.set_alertCodeNode(1);									// This is a join request so alert code is 1
 	current.set_alertTimestampNode(Time.now());
 
-	LoRA_Functions::changeType(current.get_nodeNumber(), current.get_sensorType(), true);  // Record the sensor type in the nodeID structure
+	LoRA_Functions::changeType(current.get_nodeNumber(), current.get_sensorType(), false);  // Record the sensor type in the nodeID structure
 	logPersistWindow("joinPreAck", millis() - persistStart, beforePersist);
 
 	lora_state = JOIN_ACK;			// Prepare to respond
@@ -650,16 +662,14 @@ bool LoRA_Functions::decipherJoinRequestGateway() {			// Ths only question here 
 bool LoRA_Functions::acknowledgeJoinRequestGateway() {
 	char messageString[128];
 	const GatewayScheduleHint scheduleHint = gatewayScheduleHint();
+	const time_t ackTime = gatewayAckTimestamp();
 	Log.info("Acknowledge Join Request");
 	// This is a response to a data message and a specific payload and message flag
 	// Send a reply back to the originator client
      
 	buf[0] = highByte(sysStatus.get_magicNumber());					// Magic number - so you can trust me
 	buf[1] = lowByte(sysStatus.get_magicNumber());					// Magic number - so you can trust me
-	buf[2] = ((uint8_t) ((Time.now()) >> 24));  					// Fourth byte - current time
-	buf[3] = ((uint8_t) ((Time.now()) >> 16));						// Third byte
-	buf[4] = ((uint8_t) ((Time.now()) >> 8));						// Second byte
-	buf[5] = ((uint8_t) (Time.now()));		    					// First byte		
+	encodeGatewayAckTimestamp(buf, ackTime);
 	buf[6] = highByte(scheduleHint.frequencyMinutes);			// Frequency of reports - for Gateways
 	buf[7] = lowByte(scheduleHint.frequencyMinutes);	
 	buf[8] = (current.get_nodeNumber() != 11) ?  0 : 1;				// Clear the alert code for the node unless the nodeNumber process failed

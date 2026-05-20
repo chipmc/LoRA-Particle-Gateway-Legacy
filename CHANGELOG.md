@@ -6,6 +6,8 @@
 - Added compact persistence timing instrumentation and 24-hour write statistics so field logs can show save latency, mirrored-write cost, and burst frequency without verbose spam.
 - Kept LoRa runtime behavior unchanged while replacing the brittle RF9X preset enum dependency with the exact equivalent modem-register shim for reproducible Boron and P2 builds.
 - Preserved existing sleep/connect, watchdog, PMIC, and timing behavior while keeping release logging concise and reducing format-string truncation risk.
+- Centralized gateway operational settings into committed `src/config.h`, kept `src/local_secrets.h` local and ignored, and preserved the existing compile-time Wi-Fi credential validation flow.
+- Kept the current v23 runtime behavior while clarifying boot/time/wake observability, suppressing invalid pre-connect Wi-Fi signal logs, and reducing low-level RTC helper noise.
 - Validated full Boron and P2 production builds for release packaging.
 
 ## v21.00 - 2026-05-09

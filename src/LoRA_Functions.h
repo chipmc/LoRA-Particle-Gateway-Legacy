@@ -213,7 +213,7 @@ public:
      * @returns the node number for this deviceID
      * 
      */
-    uint8_t findNodeNumber(const char* deviceID, int radioID, bool persistNow = true);
+    uint8_t findNodeNumber(const char* deviceID, int radioID, bool persistNow = false);
     /**
      * @brief Returns the deviceID for a provided node number.  this is used in composing Particle publish payloads
      *
@@ -236,7 +236,7 @@ public:
      * @returns sensor type
      * 
      */
-    bool changeType(int nodeNumber, int newType, bool persistNow = true);
+    bool changeType(int nodeNumber, int newType, bool persistNow = false);
 
     /**
      * @brief Get the current alert pending value from the nodeID data strcuture
@@ -254,7 +254,7 @@ public:
      * @return true 
      * @return false 
      */
-    bool changeAlert(int nodeNumber, int newAlert, bool persistNow = true);
+    bool changeAlert(int nodeNumber, int newAlert, bool persistNow = false);
 
     /**
      * @brief Primarily used for debugging
@@ -276,7 +276,7 @@ public:
      * @return true 
      * @return false 
      */
-    bool nodeUpdate(int nodeNumber, float successPercent, bool persistNow = true);
+    bool nodeUpdate(int nodeNumber, float successPercent, bool persistNow = false);
     /**
      * @brief Checks to see if the nodes have checked in recently
      * 

@@ -96,7 +96,7 @@ public:
 		uint8_t connectivityMode;                         // 0 - standard LoRA and Cellular, 1 - Long LoRA  2 - Always on LoRA, 3 - Always on LoRA and Cellular
 		uint8_t resetCount;                               // reset count of device (0-256)
 		uint8_t messageCount;							  // This is how many messages the Gateay has composed for the day
-		time_t lastHookResponse;                   		  // Last time we got a valid Webhook response
+		time_t lastTimeSync;                     		  // Last time the gateway successfully synchronized time from the network/cloud
 		time_t lastConnection;                     		  // Last time we successfully connected to Particle
 		uint16_t lastConnectionDuration;                  // How long - in seconds - did it take to last connect to the Particle cloud
 		uint16_t frequencyMinutes;                        // When we are reporing at minute increments - what are they - for Gateways
@@ -152,8 +152,8 @@ public:
 	uint8_t get_messageCount() const;
 	void set_messageCount(uint8_t value);
 
-	time_t get_lastHookResponse() const;
-	void set_lastHookResponse(time_t value);
+	time_t get_lastTimeSync() const;
+	void set_lastTimeSync(time_t value);
 
 	time_t get_lastConnection() const;
 	void set_lastConnection(time_t value);
@@ -540,6 +540,9 @@ public:
 	size_t get_nodeIDJsonLength() const;
 	bool set_nodeIDJson(const char *str);
 	bool saveNodeIDJson(const char *str, bool force = true);
+	bool hasPendingPersist() const;
+	uint32_t getDirtySinceMs() const;
+	bool persistIfDirty();
 	NodeDbPersistStats getPersistStats() const;
 	virtual bool load() override;
 	virtual void save() override;

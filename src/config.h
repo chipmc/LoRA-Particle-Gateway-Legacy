@@ -1,7 +1,7 @@
 #pragma once
 
-// Safe committed example of the shared gateway operational configuration.
-// Keep local WiFi credentials in src/local_secrets.h instead of this file.
+// Shared gateway operational configuration.
+// This file is committed and should not contain local secrets.
 
 // -----------------------------------------------------------------------------
 // Build / Diagnostics
@@ -21,18 +21,9 @@
 // Time / Timezone
 // -----------------------------------------------------------------------------
 
-// Production gateway time sync cadence.
-// Keep this at 24h unless there is a clear field need to change it.
 #define GATEWAY_TIME_SYNC_INTERVAL_SECONDS (24UL * 60UL * 60UL)
-
-// Optional development-only override for faster soak testing.
-// Leave at 0 for production builds.
 #define GATEWAY_DEV_TIME_SYNC_INTERVAL_SECONDS 0UL
-
-// Emit a drift diagnostic when the RTC restore differs from a fresh cloud time sync by more than this.
 #define GATEWAY_RTC_DRIFT_LOG_THRESHOLD_SECONDS 30UL
-
-// Local time zone used for scheduling and operator-facing log timestamps.
 #define GATEWAY_LOCAL_TIMEZONE_POSIX "SGT-8"
 #define GATEWAY_LOCAL_TIMEZONE_LABEL "SGT"
 
@@ -45,8 +36,6 @@
 #define P2_WIFI_ANTENNA_EXTERNAL 0
 
 // 1 = hidden SSID, 0 = visible SSID.
-// Hidden SSIDs are less reliable for embedded devices.
-// Only set WIFI_HIDDEN_SSID to 1 if the network is actually hidden.
 #define WIFI_HIDDEN_SSID 0
 
 #if defined(__has_include)
@@ -67,31 +56,25 @@
 // LoRa Timing
 // -----------------------------------------------------------------------------
 
-// Minutes to keep the LoRa receive window open during the scheduled listening cycle.
 #define DEFAULT_LORA_WINDOW 5
 
 // -----------------------------------------------------------------------------
 // Cloud Connectivity
 // -----------------------------------------------------------------------------
 
-// Minutes to remain cloud-connected after a successful Particle connection.
 #define STAY_CONNECTED 60
-
-// Maximum time to wait for a cloud time sync request to complete.
 #define PARTICLE_SYNC_TIMEOUT_MS 45000UL
 
 // -----------------------------------------------------------------------------
 // Sleep / Power
 // -----------------------------------------------------------------------------
 
-// Hard cap while draining the publish queue before forced disconnect.
 #define DISCONNECTING_HARD_TIMEOUT_MS 180000UL
 
 // -----------------------------------------------------------------------------
 // Watchdog / Safety
 // -----------------------------------------------------------------------------
 
-// Millisecond guard against an unexpectedly stuck multi-hour connect attempt.
 #define PARTICLE_CONNECT_GUARD_TIMEOUT_MS (6UL * 60UL * 60UL * 1000UL)
 
 #if UPDATE_WIFI_CREDENTIALS

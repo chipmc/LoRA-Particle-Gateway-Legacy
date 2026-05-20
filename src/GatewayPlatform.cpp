@@ -138,7 +138,9 @@ const char *gatewayReleaseString() {
 }
 
 void logGatewayBootHeader() {
-	Log.info("Boot: platform=%s transport=%s deviceOS=%s release=%s flags(field=%d loraDiag=%d verbose=%d) resetReason=%d resetData=%lu", gatewayPlatformName(), gatewayTransportName(), System.version().c_str(), gatewayReleaseString(), FIELD_DEBUG_BUILD, LORA_DIAGNOSTICS, VERBOSE_SYSTEM_LOGS, (int)System.resetReason(), (unsigned long)System.resetReasonData());
+	Log.info("Boot: FW=%s platform=%s transport=%s deviceOS=%s", GATEWAY_FW_VERSION, gatewayPlatformName(), gatewayTransportName(), System.version().c_str());
+	Log.info("Boot: BuildID=%s", GATEWAY_FW_BUILD_ID);
+	Log.info("Boot: flags(field=%d loraDiag=%d verbose=%d) resetReason=%d resetData=%lu", FIELD_DEBUG_BUILD, LORA_DIAGNOSTICS, VERBOSE_SYSTEM_LOGS, (int)System.resetReason(), (unsigned long)System.resetReasonData());
 }
 
 void startNetworkConnect() {
@@ -330,10 +332,19 @@ void logSignalStrength() {
 #if HAL_PLATFORM_CELLULAR
 	const char *radioTech[] = {"Unknown", "None", "WiFi", "GSM", "UMTS", "CDMA", "LTE", "IEEE802154", "LTE_CAT_M1", "LTE_CAT_NB1"};
 	auto sig = Cellular.RSSI();
+	if (!Cellular.ready() || sig.getStrength() < 0.0f || sig.getQuality() < 0.0f) {
+		return;
+	}
 	auto rat = sig.getAccessTechnology();
 	Log.info("%s S:%2.0f%%, Q:%2.0f%%", radioTech[rat], sig.getStrength(), sig.getQuality());
 #elif HAL_PLATFORM_WIFI
+	if (!WiFi.ready()) {
+		return;
+	}
 	auto sig = WiFi.RSSI();
+	if (sig.getStrength() < 0.0f || sig.getQuality() < 0.0f) {
+		return;
+	}
 	Log.info("WiFi S:%2.0f%%, Q:%2.0f%%", sig.getStrength(), sig.getQuality());
 #endif
 }

@@ -39,11 +39,6 @@
 // v21.00 - Gateway production hardening release with FRAM repair/verification, normalized logging, battery telemetry, safe local config handling, and boot reset diagnostics
 // v23.00 - Release finalization with NodeDB save coalescing, ACK-path persistence reduction, compact persistence instrumentation, and RF9X modem-config compatibility build fix
 
-#define DEFAULT_LORA_WINDOW 5
-#define STAY_CONNECTED 60
-#define PARTICLE_SYNC_TIMEOUT_MS 45000UL
-#define DISCONNECTING_HARD_TIMEOUT_MS 180000UL
-
 // Particle Libraries
 #include "PublishQueuePosixRK.h"			        // https://github.com/rickkas7/PublishQueuePosixRK
 #include "LocalTimeRK.h"					        // https://rickkas7.github.io/LocalTimeRK/
@@ -70,6 +65,13 @@ void serviceBackgroundTasksDuringWait(void);
 bool waitForParticleSyncWithHousekeeping(uint32_t timeoutMs);
 bool isParkOpenNow(void);
 unsigned long nextWakeIntervalSeconds(void);
+void refreshGatewayLocalTimeCache(void);
+bool shouldSyncGatewayTime(time_t currentTime);
+bool syncGatewayTimeIfNeeded(void);
+void logGatewayBootTimeStatus(void);
+String formatGatewayLocalTime(time_t timestamp);
+String formatGatewayUtcTime(time_t timestamp);
+String formatGatewaySyncAge(time_t currentTime, time_t lastTimeSync);
 
 // System Health Variables
 int outOfMemory = -1;                               // From reference code provided in AN0023 (see above)
@@ -88,6 +90,222 @@ void outOfMemoryHandler(system_event_t event, int param);
 
 // Program Variables
 volatile bool userSwitchDectected = false;	
+
+namespace {
+
+struct GatewayLocalTime {
+	bool valid;
+	time_t utcTime;
+	int hour;
+	int minute;
+	int second;
+	String dateKey;
+};
+
+unsigned long gatewayTimeSyncIntervalSeconds() {
+#if GATEWAY_DEV_TIME_SYNC_INTERVAL_SECONDS > 0UL
+	return GATEWAY_DEV_TIME_SYNC_INTERVAL_SECONDS;
+#else
+	return GATEWAY_TIME_SYNC_INTERVAL_SECONDS;
+#endif
+}
+
+uint32_t particleConnectGuardStartedMs = 0;
+
+void startParticleConnectGuard() {
+	particleConnectGuardStartedMs = millis();
+	Log.info("Particle guard started ms=%lu", (unsigned long)particleConnectGuardStartedMs);
+}
+
+void clearParticleConnectGuard() {
+	particleConnectGuardStartedMs = 0;
+}
+
+bool hasExceededParticleConnectGuardTimeout() {
+	if (particleConnectGuardStartedMs == 0) {
+		return false;
+	}
+
+	const uint32_t elapsedMs = millis() - particleConnectGuardStartedMs;
+	if (elapsedMs < PARTICLE_CONNECT_GUARD_TIMEOUT_MS) {
+		return false;
+	}
+
+	Log.warn("Particle guard triggered elapsed=%lus threshold=%lus",
+		(unsigned long)(elapsedMs / 1000UL),
+		(unsigned long)(PARTICLE_CONNECT_GUARD_TIMEOUT_MS / 1000UL));
+	return true;
+}
+
+GatewayLocalTime getGatewayLocalTime(time_t utcTime) {
+	GatewayLocalTime localTime = {false, 0, 0, 0, 0, String()};
+	if (utcTime <= 0) {
+		return localTime;
+	}
+
+	LocalTimeConvert localConv(conv);
+	localConv.withTime(utcTime).convert();
+	localTime.valid = true;
+	localTime.utcTime = utcTime;
+	localTime.hour = localConv.getLocalTimeHMS().hour;
+	localTime.minute = localConv.getLocalTimeHMS().minute;
+	localTime.second = localConv.getLocalTimeHMS().second;
+	localTime.dateKey = localConv.format("%Y-%m-%d");
+	return localTime;
+}
+
+GatewayLocalTime getGatewayCurrentLocalTime() {
+	if (!Time.isValid()) {
+		return GatewayLocalTime{false, 0, 0, 0, 0, String()};
+	}
+	return getGatewayLocalTime(Time.now());
+}
+
+String formatGatewayLocalClockTime(time_t utcTime) {
+	const GatewayLocalTime localTime = getGatewayLocalTime(utcTime);
+	if (!localTime.valid) {
+		return "invalid";
+	}
+	return String::format("%02d:%02d:%02d", localTime.hour, localTime.minute, localTime.second);
+}
+
+bool isGatewayWithinOpenHours(const GatewayLocalTime &localTime) {
+	if (!localTime.valid) {
+		return true;
+	}
+	return (localTime.hour >= sysStatus.get_openTime() && localTime.hour <= sysStatus.get_closeTime());
+}
+
+bool isNewGatewayLocalDaySince(time_t utcTime) {
+	const GatewayLocalTime currentLocalTime = getGatewayCurrentLocalTime();
+	const GatewayLocalTime referenceLocalTime = getGatewayLocalTime(utcTime);
+	if (!currentLocalTime.valid || !referenceLocalTime.valid) {
+		return false;
+	}
+	return currentLocalTime.dateKey != referenceLocalTime.dateKey;
+}
+
+bool hasGatewayLocalHourChangedSince(time_t utcTime) {
+	const GatewayLocalTime currentLocalTime = getGatewayCurrentLocalTime();
+	if (!currentLocalTime.valid) {
+		return false;
+	}
+	const GatewayLocalTime referenceLocalTime = getGatewayLocalTime(utcTime);
+	if (!referenceLocalTime.valid) {
+		return true;
+	}
+	return currentLocalTime.hour != referenceLocalTime.hour;
+}
+
+} // anonymous namespace
+
+String formatGatewayLocalTime(time_t timestamp) {
+	if (timestamp <= 0) {
+		return "invalid";
+	}
+	LocalTimeConvert localConv(conv);
+	localConv.withTime(timestamp).convert();
+	return localConv.format("%Y-%m-%d %H:%M:%S");
+}
+
+String formatGatewayUtcTime(time_t timestamp) {
+	if (timestamp <= 0) {
+		return "invalid";
+	}
+
+	struct tm utcTm = {};
+	gmtime_r(&timestamp, &utcTm);
+	char buffer[24];
+	strftime(buffer, sizeof(buffer), "%Y-%m-%d %H:%M:%S", &utcTm);
+	return String(buffer);
+}
+
+String formatGatewaySyncAge(time_t currentTime, time_t lastTimeSync) {
+	if (currentTime <= 0 || lastTimeSync <= 0 || lastTimeSync > currentTime) {
+		return "unknown";
+	}
+
+	const unsigned long ageSeconds = (unsigned long)(currentTime - lastTimeSync);
+	if (ageSeconds >= 3600UL) {
+		return String::format("%luh%lum", ageSeconds / 3600UL, (ageSeconds % 3600UL) / 60UL);
+	}
+	if (ageSeconds >= 60UL) {
+		return String::format("%lum%lus", ageSeconds / 60UL, ageSeconds % 60UL);
+	}
+	return String::format("%lus", ageSeconds);
+}
+
+void refreshGatewayLocalTimeCache(void) {
+	if (Time.isValid()) {
+		conv.withCurrentTime().convert();
+	}
+}
+
+bool shouldSyncGatewayTime(time_t currentTime) {
+	if (currentTime <= 0) {
+		return true;
+	}
+
+	const time_t lastTimeSync = sysStatus.get_lastTimeSync();
+	if (lastTimeSync <= 0 || lastTimeSync > currentTime) {
+		return true;
+	}
+
+	return (unsigned long)(currentTime - lastTimeSync) >= gatewayTimeSyncIntervalSeconds();
+}
+
+void logGatewayBootTimeStatus(void) {
+	const bool rtcSet = ab1805.isRTCSet();
+	const time_t currentTime = Time.isValid() ? Time.now() : 0;
+	const time_t lastTimeSync = sysStatus.get_lastTimeSync();
+	Log.info("Time: rtc=%s utc=%s local=%s tz=%s syncAge=%s", rtcSet ? "ok" : "fail", formatGatewayUtcTime(currentTime).c_str(), formatGatewayLocalTime(currentTime).c_str(), GATEWAY_LOCAL_TIMEZONE_LABEL, formatGatewaySyncAge(currentTime, lastTimeSync).c_str());
+}
+
+bool syncGatewayTimeIfNeeded(void) {
+	const time_t currentTime = Time.isValid() ? Time.now() : 0;
+	if (!shouldSyncGatewayTime(currentTime)) {
+		refreshGatewayLocalTimeCache();
+		return false;
+	}
+
+	time_t rtcTimeBefore = 0;
+	const bool rtcTimeAvailable = ab1805.isRTCSet() && ab1805.getRtcAsTime(rtcTimeBefore);
+	const time_t lastTimeSync = sysStatus.get_lastTimeSync();
+	const char *reason = (!Time.isValid()) ? "invalid" : ((lastTimeSync <= 0 || lastTimeSync > currentTime) ? "unknown" : "stale");
+	Log.info("TimeSync: request reason=%s lastSyncAge=%s", reason, formatGatewaySyncAge(currentTime, lastTimeSync).c_str());
+
+	Particle.syncTime();
+	if (!waitForParticleSyncWithHousekeeping(PARTICLE_SYNC_TIMEOUT_MS)) {
+		Log.error("TimeSync: timeout after %lu ms", PARTICLE_SYNC_TIMEOUT_MS);
+		return false;
+	}
+	if (!Time.isValid()) {
+		Log.error("TimeSync: sync completed without valid time");
+		return false;
+	}
+
+	const time_t syncedTime = Time.now();
+	refreshGatewayLocalTimeCache();
+	sysStatus.set_lastTimeSync(syncedTime);
+
+	if (rtcTimeAvailable) {
+		long driftSeconds = (long)(syncedTime - rtcTimeBefore);
+		if (driftSeconds < 0) {
+			driftSeconds = -driftSeconds;
+		}
+		if ((unsigned long)driftSeconds > GATEWAY_RTC_DRIFT_LOG_THRESHOLD_SECONDS) {
+			Log.warn("TimeSync: drift=%lds rtc=%lu cloud=%lu action=rtc_update", driftSeconds, (unsigned long)rtcTimeBefore, (unsigned long)syncedTime);
+		}
+	}
+
+	if (!ab1805.setRtcFromTime(syncedTime)) {
+		Log.error("TimeSync: rtc_update_failed cloud=%lu", (unsigned long)syncedTime);
+		return false;
+	}
+
+	Log.info("RTC sync: utc=%s local=%s tz=%s", formatGatewayUtcTime(syncedTime).c_str(), formatGatewayLocalTime(syncedTime).c_str(), GATEWAY_LOCAL_TIMEZONE_LABEL);
+	return true;
+}
 
 void setup() 
 {
@@ -120,17 +338,18 @@ void setup()
 	LoRA_Functions::instance().logGatewayDio0Setup("post-lora-setup");
 
 	// Setup local time and set the publishing schedule
-	LocalTime::instance().withConfig(LocalTimePosixTimezone("EST5EDT,M3.2.0/2:00:00,M11.1.0/2:00:00"));			// East coast of the US
-	conv.withCurrentTime().convert();  				        // Convert to local time for use later
+	// LocalTime::instance().withConfig(LocalTimePosixTimezone("EST5EDT,M3.2.0/2:00:00,M11.1.0/2:00:00"));			// East coast of the US
+	LocalTime::instance().withConfig(LocalTimePosixTimezone(GATEWAY_LOCAL_TIMEZONE_POSIX));
+	refreshGatewayLocalTimeCache();
 	const int buttonState = digitalRead(BUTTON_PIN);
 	const uint8_t connectivityMode = sysStatus.get_connectivityMode();
 	const bool timeValid = Time.isValid();
+	const bool syncDueAtBoot = shouldSyncGatewayTime(timeValid ? Time.now() : 0);
 
-	if (timeValid) {
-		Log.info("LocalTime initialized, time is %s and RTC %s set", conv.format("%I:%M:%S%p").c_str(), (ab1805.isRTCSet()) ? "is" : "is not");
-	}
-	else {
-		Log.info("LocalTime not initialized so will need to Connect to Particle");
+	logGatewayBootTimeStatus();
+
+	if (!timeValid || syncDueAtBoot) {
+		Log.info("TimeSync: boot action=connect reason=%s", timeValid ? "due" : "invalid");
 		state = CONNECTING_STATE;
 	}
 
@@ -159,13 +378,14 @@ void loop() {
 
 		case SLEEPING_STATE: {
 			unsigned long wakeInSeconds;
-			time_t time;
+			time_t nextWakeTime;
 
 			publishStateTransition();                   					// We will apply the back-offs before sending to ERROR state - so if we are here we will take action
 			current.set_openHours(isParkOpenNow());
+			nodeDatabase.persistIfDirty();
 			wakeInSeconds = nextWakeIntervalSeconds();
-			time = Time.now() + wakeInSeconds;
-			Log.info("Sleep for %lu seconds until next event at %s", wakeInSeconds, Time.format(time, "%T").c_str());
+			nextWakeTime = Time.now() + wakeInSeconds;
+			Log.info("Sleep for %lu seconds until next event at %s", wakeInSeconds, formatGatewayLocalClockTime(nextWakeTime).c_str());
 			config.mode(SystemSleepMode::ULTRA_LOW_POWER)
 				.gpio(BUTTON_PIN,CHANGE)
 				.duration(wakeInSeconds * 1000L);
@@ -178,7 +398,13 @@ void loop() {
 				Log.info("Woke with user button");
 			}
 			else {															   // Awoke for time
-				Log.info("Awoke at %s with %li free memory", Time.format(Time.now(), "%T").c_str(), System.freeMemory());
+				current.set_openHours(isParkOpenNow());
+				if (current.get_openHours()) {
+					Log.info("Wake: hourly listening window start local=%s duration=%um", formatGatewayLocalClockTime(Time.now()).c_str(), DEFAULT_LORA_WINDOW);
+				}
+				else {
+					Log.info("Wake: scheduled timer local=%s", formatGatewayLocalClockTime(Time.now()).c_str());
+				}
 			}
 			state = IDLE_STATE;
 
@@ -201,7 +427,7 @@ void loop() {
 
 				LoRA_Functions::instance().logGatewayStateEntry();
 
-				Log.info("Gateway is listening for %d minutes for LoRA messages and the park is %s (%d / %d / %d)", (sysStatus.get_connectivityMode() == 0) ? DEFAULT_LORA_WINDOW : 60, (current.get_openHours()) ? "open":"closed", conv.getLocalTimeHMS().hour, sysStatus.get_openTime(), sysStatus.get_closeTime());
+				Log.info("Gateway is listening for %d minutes for LoRA messages and the park is %s (%d / %d / %d)", (sysStatus.get_connectivityMode() == 0) ? DEFAULT_LORA_WINDOW : STAY_CONNECTED, (current.get_openHours()) ? "open":"closed", conv.getLocalTimeHMS().hour, sysStatus.get_openTime(), sysStatus.get_closeTime());
 			} 
 
 			if ((millis() - lastLoRaDiagnosticLog) >= 15000UL) {
@@ -215,13 +441,13 @@ void loop() {
 				}
 			}
 
-			if ((millis() - startLoRAWindow) > (connectionWindow *60000UL)) { 					// Keeps us in listening mode for the specified windpw - then back to idle unless in test mode - keeps listening
+				if ((millis() - startLoRAWindow) > (connectionWindow *60000UL)) { 					// Keeps us in listening mode for the specified windpw - then back to idle unless in test mode - keeps listening
 				Log.info("Listening window over");
 				LoRA_Functions::instance().nodeConnectionsHealthy();							// Will see if any nodes checked in - if not - will reset
 				LoRA_Functions::instance().sleepLoRaRadio();									// Done with the LoRA phase - put the radio to sleep
 				LoRA_Functions::instance().printNodeData(false);
-				nodeDatabase.flush(true);
-				if (Time.hour() != Time.hour(sysStatus.get_lastConnection()) && current.get_openHours()) state = CONNECTING_STATE;  	// Only Connect once an hour after the LoRA window is over and if the park is open			
+				nodeDatabase.persistIfDirty();
+					if (hasGatewayLocalHourChangedSince(sysStatus.get_lastConnection()) && current.get_openHours()) state = CONNECTING_STATE;  	// Only Connect once an hour after the LoRA window is over and if the park is open			
 				else if (sysStatus.get_alertCodeGateway() != 0) state = ERROR_STATE;
 				else state = SLEEPING_STATE;
 			}
@@ -245,18 +471,27 @@ void loop() {
 
 			if (state != oldState) {
 				publishStateTransition();  
-				if (Time.day(sysStatus.get_lastConnection()) != conv.getLocalTimeYMD().getDay()) {
+				if (sysStatus.get_lastConnection() > 0 && isNewGatewayLocalDaySince(sysStatus.get_lastConnection())) {
 					current.resetEverything();
 					Log.info("New Day - Resetting everything");
 				}
 				publishWebhook(sysStatus.get_nodeNumber());								// Before we connect - let's send the gateway's webhook
 				if (!isCloudConnected()) startNetworkConnect();						// Time to connect to the active network transport
 				connectingTimeout = millis();
+				startParticleConnectGuard();
 #if HAL_PLATFORM_WIFI
 				connectStartedMs = connectingTimeout;
 				wifiConnectedMs = 0;
 				cloudConnectedMs = 0;
 #endif
+			}
+
+			if (hasExceededParticleConnectGuardTimeout()) {
+				clearParticleConnectGuard();
+				sysStatus.set_alertCodeGateway(1);
+				sysStatus.set_alertTimestampGateway(Time.now());
+				state = ERROR_STATE;
+				break;
 			}
 
 #if HAL_PLATFORM_WIFI
@@ -272,13 +507,13 @@ void loop() {
 					cloudConnectedMs = millis();
 				}
 				#endif
-				sysStatus.set_lastConnection(Time.now());
+				syncGatewayTimeIfNeeded();
+				if (Time.isValid()) {
+					refreshGatewayLocalTimeCache();
+					sysStatus.set_lastConnection(Time.now());
+				}
 				sysStatus.set_lastConnectionDuration((millis() - connectingTimeout) / 1000);	// Record connection time in seconds
 				if (isCloudConnected()) {
-					Particle.syncTime();												// To prevent large connections, we will sync every hour when we connect to the cellular network.
-					if (!waitForParticleSyncWithHousekeeping(PARTICLE_SYNC_TIMEOUT_MS)) {
-						Log.error("Particle time sync timed out after %lu ms - continuing without fresh sync", PARTICLE_SYNC_TIMEOUT_MS);
-					}
 					#if HAL_PLATFORM_WIFI
 					int strength = 0;
 					int quality = 0;
@@ -292,6 +527,7 @@ void loop() {
 					logSignalStrength();
 					#endif
 				}
+				clearParticleConnectGuard();
 				if (sysStatus.get_connectivityMode() == 1) state = LoRA_STATE;			// Go back to the LoRA State if we are in connected mode
 				else state = DISCONNECTING_STATE;	 									// Typically, we will disconnect and sleep to save power - publishes occur during the 90 seconds before disconnect
 			}
@@ -308,6 +544,7 @@ void loop() {
 				#endif
 				Log.info("Failed to connect in 10 minutes - giving up");
 				sysStatus.set_connectivityMode(0);										// Setting back to zero - must not have coverage here or here at this time
+				clearParticleConnectGuard();
 				state = DISCONNECTING_STATE;											// Makes sure we turn off the radio
 			}
 
@@ -354,6 +591,7 @@ void loop() {
 
 			if (millis() - resetTimeout > 30000L) {
 				Log.info("Deep power down device");
+				nodeDatabase.persistIfDirty();
 				softDelay(2000);
 				ab1805.deepPowerDown(); 
 			}
@@ -372,6 +610,7 @@ void loop() {
 
 	if (outOfMemory >= 0) {                         // In this function we are going to reset the system if there is an out of memory error
 		Log.info("Resetting due to low memory");
+		nodeDatabase.persistIfDirty();
 		softDelay(2000);
 		System.reset();
   	}
@@ -389,6 +628,10 @@ void publishStateTransition(void)
 	const State previousState = oldState;
 
 	oldState = state;
+
+	if (previousState == CONNECTING_STATE && state != CONNECTING_STATE) {
+		clearParticleConnectGuard();
+	}
 
 	if (state == IDLE_STATE && !Time.isValid()) {
 		Log.info("From %s to %s with invalid time", stateNames[previousState], stateNames[state]);
@@ -466,33 +709,40 @@ inline void softDelay(uint32_t t) {
 }
 
 bool isParkOpenNow(void) {
-	conv.withCurrentTime().convert();
-	const int currentHour = conv.getLocalTimeHMS().hour;
-	return (currentHour >= sysStatus.get_openTime() && currentHour <= sysStatus.get_closeTime());
+	const GatewayLocalTime localTime = getGatewayCurrentLocalTime();
+	if (!localTime.valid) {
+		return true;
+	}
+	return isGatewayWithinOpenHours(localTime);
 }
 
 unsigned long nextWakeIntervalSeconds(void) {
+	if (!Time.isValid()) {
+		return max(60UL, (unsigned long)sysStatus.get_frequencyMinutes() * 60UL);
+	}
+	const GatewayLocalTime localTime = getGatewayCurrentLocalTime();
+	if (!localTime.valid) {
+		return max(60UL, (unsigned long)sysStatus.get_frequencyMinutes() * 60UL);
+	}
 	const unsigned long wakeBoundary = (sysStatus.get_frequencyMinutes() * 60UL);
-	const unsigned long nextBoundary = constrain(wakeBoundary - (Time.now() % wakeBoundary), 0UL, wakeBoundary);
-	time_t nextBoundaryTime = Time.now() + nextBoundary;
-	LocalTimeConvert nextWakeConv(conv);
-	nextWakeConv.withTime(nextBoundaryTime).convert();
-	const int nextWakeHour = nextWakeConv.getLocalTimeHMS().hour;
+	const unsigned long secondsSinceLocalMidnight = ((unsigned long)localTime.hour * 3600UL) + ((unsigned long)localTime.minute * 60UL) + (unsigned long)localTime.second;
+	const unsigned long nextBoundary = wakeBoundary - (secondsSinceLocalMidnight % wakeBoundary);
+	const unsigned long nextBoundarySecondsSinceMidnight = (secondsSinceLocalMidnight + nextBoundary) % (24UL * 60UL * 60UL);
+	const int nextWakeHour = (int)(nextBoundarySecondsSinceMidnight / 3600UL);
 	const bool nextBoundaryIsOpen = (nextWakeHour >= sysStatus.get_openTime() && nextWakeHour <= sysStatus.get_closeTime());
 
 	if (current.get_openHours() && nextBoundaryIsOpen) {
 		return nextBoundary;
 	}
 
-	const int currentHour = conv.getLocalTimeHMS().hour;
-	int hoursUntilOpen = (int)sysStatus.get_openTime() - currentHour;
+	int hoursUntilOpen = (int)sysStatus.get_openTime() - localTime.hour;
 	if (hoursUntilOpen <= 0) {
 		hoursUntilOpen += 24;
 	}
 
 	const unsigned long secondsUntilOpen = (unsigned long)hoursUntilOpen * 3600UL
-		- ((unsigned long)conv.getLocalTimeHMS().minute * 60UL)
-		- (unsigned long)conv.getLocalTimeHMS().second;
+		- ((unsigned long)localTime.minute * 60UL)
+		- (unsigned long)localTime.second;
 
 	return max(1UL, secondsUntilOpen);
 }

@@ -5,7 +5,7 @@
 #if __has_include("config.h")
 #include "config.h"
 #else
-#error "Missing src/config.h. Copy src/config.example.h to src/config.h: cp src/config.example.h src/config.h"
+#error "Missing src/config.h. Restore the committed file or rebuild it from src/config.example.h."
 #endif
 #else
 #include "config.h"
@@ -23,6 +23,46 @@
 
 #ifndef VERBOSE_SYSTEM_LOGS
 #define VERBOSE_SYSTEM_LOGS FIELD_DEBUG_BUILD
+#endif
+
+#ifndef GATEWAY_TIME_SYNC_INTERVAL_SECONDS
+#define GATEWAY_TIME_SYNC_INTERVAL_SECONDS (24UL * 60UL * 60UL)
+#endif
+
+#ifndef GATEWAY_DEV_TIME_SYNC_INTERVAL_SECONDS
+#define GATEWAY_DEV_TIME_SYNC_INTERVAL_SECONDS 0UL
+#endif
+
+#ifndef GATEWAY_RTC_DRIFT_LOG_THRESHOLD_SECONDS
+#define GATEWAY_RTC_DRIFT_LOG_THRESHOLD_SECONDS 30UL
+#endif
+
+#ifndef GATEWAY_LOCAL_TIMEZONE_POSIX
+#define GATEWAY_LOCAL_TIMEZONE_POSIX "UTC0"
+#endif
+
+#ifndef GATEWAY_LOCAL_TIMEZONE_LABEL
+#define GATEWAY_LOCAL_TIMEZONE_LABEL "UTC"
+#endif
+
+#ifndef DEFAULT_LORA_WINDOW
+#define DEFAULT_LORA_WINDOW 5
+#endif
+
+#ifndef STAY_CONNECTED
+#define STAY_CONNECTED 60
+#endif
+
+#ifndef PARTICLE_SYNC_TIMEOUT_MS
+#define PARTICLE_SYNC_TIMEOUT_MS 45000UL
+#endif
+
+#ifndef PARTICLE_CONNECT_GUARD_TIMEOUT_MS
+#define PARTICLE_CONNECT_GUARD_TIMEOUT_MS (6UL * 60UL * 60UL * 1000UL)
+#endif
+
+#ifndef DISCONNECTING_HARD_TIMEOUT_MS
+#define DISCONNECTING_HARD_TIMEOUT_MS 180000UL
 #endif
 
 #ifndef UPDATE_WIFI_CREDENTIALS
@@ -55,6 +95,8 @@
 
 #define GATEWAY_PRODUCT_VERSION 23
 #define GATEWAY_RELEASE_STRING "23.00"
+#define GATEWAY_FW_VERSION GATEWAY_RELEASE_STRING
+#define GATEWAY_FW_BUILD_ID GATEWAY_RELEASE_STRING " " __DATE__ " " __TIME__
 
 static const uint8_t GATEWAY_BATTERY_STATE_NA = 7;
 static const uint8_t GATEWAY_BATTERY_STATE_ESTIMATED = 8;

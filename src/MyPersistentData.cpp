@@ -84,7 +84,7 @@ void sysStatusData::initialize() {
     sysStatus.set_connectivityMode(0);
     sysStatus.set_resetCount(0);
     sysStatus.set_messageCount(0);
-    sysStatus.set_lastHookResponse(0);
+    sysStatus.set_lastTimeSync(0);
     sysStatus.set_frequencyMinutes(60);
     sysStatus.set_updatedFrequencyMinutes(0);
     sysStatus.set_alertCodeGateway(0);
@@ -146,12 +146,12 @@ void sysStatusData::set_messageCount(uint8_t value) {
     setValue<uint8_t>(offsetof(SysData, messageCount), value);
 }
 
-time_t sysStatusData::get_lastHookResponse() const {
-    return getValue<time_t>(offsetof(SysData, lastHookResponse));
+time_t sysStatusData::get_lastTimeSync() const {
+    return getValue<time_t>(offsetof(SysData, lastTimeSync));
 }
 
-void sysStatusData::set_lastHookResponse(time_t value) {
-    setValue<time_t>(offsetof(SysData, lastHookResponse), value);
+void sysStatusData::set_lastTimeSync(time_t value) {
+    setValue<time_t>(offsetof(SysData, lastTimeSync), value);
 }
 
 time_t sysStatusData::get_lastConnection() const {
@@ -592,7 +592,6 @@ void nodeIDData::save() {
 }
 
 void nodeIDData::loop() {
-    nodeDatabase.flush(false);
     maybeLogPersist24h();
 }
 
@@ -690,14 +689,59 @@ bool nodeIDData::saveNodeIDJson(const char *str, bool force) {
         return false;
     }
 
+    const bool hadPendingPersist = hasPendingPersist();
     if (!set_nodeIDJson(str)) {
         Log.error("NodeDB save rejected: len=%u", (unsigned)jsonLength);
         return false;
     }
 
-    flush(force);
-    if (force) {
+    if (!force) {
+        if (!hadPendingPersist && hasPendingPersist()) {
+            Log.info("NodeDB marked dirty");
+        }
+        return true;
+    }
+
+    flush(true);
+    if (hadPendingPersist || hasPendingPersist() == false) {
         Log.info("NodeDB atomic save complete");
+    }
+    return true;
+}
+
+bool nodeIDData::hasPendingPersist() const {
+    bool pending = false;
+    WITH_LOCK(*this) {
+        pending = (lastUpdate != 0);
+    }
+    return pending;
+}
+
+uint32_t nodeIDData::getDirtySinceMs() const {
+    uint32_t dirtySinceMs = 0;
+    WITH_LOCK(*this) {
+        dirtySinceMs = lastUpdate;
+    }
+    return dirtySinceMs;
+}
+
+bool nodeIDData::persistIfDirty() {
+    const NodeDbPersistStats before = getPersistStats();
+    if (!hasPendingPersist()) {
+        return false;
+    }
+
+    Log.info("Persisting deferred NodeDB update");
+    flush(true);
+
+    const NodeDbPersistStats after = getPersistStats();
+    if (after.saveCount == before.saveCount) {
+        return false;
+    }
+
+    Log.info("NodeDB atomic save complete");
+    if (after.lastMs > NODE_DB_PERSIST_CRITICAL_MS) {
+        Log.error("PersistCrit: deferredSave=%ums mirror=%ums", after.lastMs, after.lastMirrorMs);
     }
     return true;
 }

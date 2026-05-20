@@ -51,7 +51,7 @@ void AB1805::setup(bool callBegin) {
             getRtcAsTime(time);
             Time.setTime(time);
 
-            _log.info("set system clock from RTC %s", formatTimeForLog(time).c_str());
+            _log.trace("set system clock from RTC %s", formatTimeForLog(time).c_str());
         }
     }
     else {
@@ -70,7 +70,7 @@ void AB1805::loop() {
 
         time = 0;
         getRtcAsTime(time);
-        _log.info("set RTC from cloud %s", formatTimeForLog(time).c_str());
+        _log.trace("set RTC from cloud %s", formatTimeForLog(time).c_str());
 
     }
 
@@ -274,7 +274,7 @@ bool AB1805::setRtcFromTm(const struct tm *timeptr, bool lock) {
     static const char *errorMsg = "failure in setRtcFromTm %d";
     uint8_t array[8];
 
-    _log.info("setRtcAsTm %s", tmToString(timeptr).c_str());
+    _log.trace("setRtcAsTm %s", tmToString(timeptr).c_str());
 
     if (lock) {
         wire.lock();
@@ -333,7 +333,7 @@ bool AB1805::getRtcAsTm(struct tm *timeptr) {
         if (bResult) {
             registersToTm(&array[1], timeptr, true);
 
-            _log.info("getRtcAsTm %s", tmToString(timeptr).c_str());
+            _log.trace("getRtcAsTm %s", tmToString(timeptr).c_str());
         }
     }
     if (!bResult) {

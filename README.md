@@ -2,6 +2,29 @@
 
 This is an implementation of Jeff Skarda's mesh extension to the Radiohead RF-95 Library.
 
+## Local config
+
+This repo commits `src/config.h` as the shared operational configuration surface.
+It contains tester and operator settings such as timing, timezone, diagnostics, and antenna selection.
+
+Local WiFi credentials stay in an optional ignored `src/local_secrets.h`, which `src/config.h` includes automatically when present.
+If you need local WiFi credentials, create or edit `src/local_secrets.h` with:
+
+```cpp
+#pragma once
+#define WIFI_SSID "actual ssid"
+#define WIFI_PASSWORD "actual password"
+```
+
+`src/config.example.h` remains a safe reference template for the shared operational settings.
+The common build include point is `src/GatewayPlatform.h`, which still fails with a clear compile-time error if `src/config.h` is missing.
+
+Time sync configuration also lives in the shared config:
+
+- `GATEWAY_TIME_SYNC_INTERVAL_SECONDS` defaults to daily production sync.
+- `GATEWAY_DEV_TIME_SYNC_INTERVAL_SECONDS` stays `0` unless you explicitly want a shorter development cadence.
+- `GATEWAY_RTC_DRIFT_LOG_THRESHOLD_SECONDS` controls when a drift diagnostic is emitted after cloud time sync.
+
 ## Initial Implementation - Adding LoRA to Cellular for more complete coverage!
 
 The itent of this project is to show how data collected from remote LoRA nodes can be relayed to a server and on to the internet using a cellular connection
