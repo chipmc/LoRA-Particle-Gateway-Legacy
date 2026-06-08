@@ -84,6 +84,178 @@ struct GatewayScheduleHint {
 	bool openHours;
 };
 
+struct NodeFrequencyState {
+	uint16_t desiredReportFrequencyMinutes;
+	uint16_t nodeAcknowledgedFrequencyMinutes;
+};
+
+const uint16_t GATEWAY_NORMAL_REPORT_FREQUENCY_MINUTES = 60;
+const uint16_t GATEWAY_LEVEL_1_REPORT_FREQUENCY_MINUTES = 120;
+const uint16_t GATEWAY_LEVEL_2_REPORT_FREQUENCY_MINUTES = 240;
+const uint16_t GATEWAY_LEVEL_3_REPORT_FREQUENCY_MINUTES = 480;
+const uint16_t GATEWAY_NORMAL_LISTEN_WINDOW_SECONDS = 5U * 60U;
+const uint16_t GATEWAY_LEVEL_1_LISTEN_WINDOW_SECONDS = 2U * 60U;
+const uint16_t GATEWAY_LEVEL_2_LISTEN_WINDOW_SECONDS = 60U;
+const uint16_t GATEWAY_LEVEL_3_LISTEN_WINDOW_SECONDS = 30U;
+
+static uint8_t batteryBackoffLevel = 0;
+static float batteryBackoffLastSoc = 100.0f;
+
+uint16_t batteryBackoffFrequencyForLevel(uint8_t level) {
+	switch (level) {
+		case 1:
+			return GATEWAY_LEVEL_1_REPORT_FREQUENCY_MINUTES;
+		case 2:
+			return GATEWAY_LEVEL_2_REPORT_FREQUENCY_MINUTES;
+		case 3:
+			return GATEWAY_LEVEL_3_REPORT_FREQUENCY_MINUTES;
+		default:
+			return GATEWAY_NORMAL_REPORT_FREQUENCY_MINUTES;
+	}
+}
+
+uint16_t batteryBackoffListenWindowForLevel(uint8_t level) {
+	switch (level) {
+		case 1:
+			return GATEWAY_LEVEL_1_LISTEN_WINDOW_SECONDS;
+		case 2:
+			return GATEWAY_LEVEL_2_LISTEN_WINDOW_SECONDS;
+		case 3:
+			return GATEWAY_LEVEL_3_LISTEN_WINDOW_SECONDS;
+		default:
+			return GATEWAY_NORMAL_LISTEN_WINDOW_SECONDS;
+	}
+}
+
+uint8_t batteryBackoffLevelForSoc(float soc, uint8_t currentLevel) {
+	switch (currentLevel) {
+		case 0:
+			if (soc < 30.0f) return 1;
+			break;
+		case 1:
+			if (soc < 20.0f) return 2;
+			if (soc > 35.0f) return 0;
+			break;
+		case 2:
+			if (soc < 10.0f) return 3;
+			if (soc > 25.0f) return 1;
+			break;
+		case 3:
+			if (soc > 15.0f) return 2;
+			break;
+		default:
+			return 0;
+	}
+	return currentLevel;
+}
+
+NodeFrequencyState readNodeFrequencyState(const JsonParserGeneratorRK::jsmntok_t *nodeObjectContainer) {
+	NodeFrequencyState state = {GATEWAY_NORMAL_REPORT_FREQUENCY_MINUTES, GATEWAY_NORMAL_REPORT_FREQUENCY_MINUTES};
+	if (!nodeObjectContainer) {
+		return state;
+	}
+	int desiredReportFrequencyMinutes = (int)state.desiredReportFrequencyMinutes;
+	int nodeAcknowledgedFrequencyMinutes = (int)state.nodeAcknowledgedFrequencyMinutes;
+	jp.getValueByKey(nodeObjectContainer, "desiredReportFrequency", desiredReportFrequencyMinutes);
+	jp.getValueByKey(nodeObjectContainer, "nodeAcknowledgedFrequency", nodeAcknowledgedFrequencyMinutes);
+	state.desiredReportFrequencyMinutes = (uint16_t)max(0, desiredReportFrequencyMinutes);
+	state.nodeAcknowledgedFrequencyMinutes = (uint16_t)max(0, nodeAcknowledgedFrequencyMinutes);
+	if (state.desiredReportFrequencyMinutes == 0) {
+		state.desiredReportFrequencyMinutes = GATEWAY_NORMAL_REPORT_FREQUENCY_MINUTES;
+	}
+	if (state.nodeAcknowledgedFrequencyMinutes == 0) {
+		state.nodeAcknowledgedFrequencyMinutes = GATEWAY_NORMAL_REPORT_FREQUENCY_MINUTES;
+	}
+	return state;
+}
+
+bool writeNodeFrequencyState(const JsonParserGeneratorRK::jsmntok_t *nodeObjectContainer, uint16_t desiredReportFrequencyMinutes, uint16_t nodeAcknowledgedFrequencyMinutes, bool persistNow) {
+	if (!nodeObjectContainer) {
+		return false;
+	}
+	JsonModifier mod(jp);
+	mod.insertOrUpdateKeyValue(nodeObjectContainer, "desiredReportFrequency", desiredReportFrequencyMinutes);
+	mod.insertOrUpdateKeyValue(nodeObjectContainer, "nodeAcknowledgedFrequency", nodeAcknowledgedFrequencyMinutes);
+	if (persistNow) {
+		nodeDatabase.saveNodeIDJson(jp.getBuffer());
+	}
+	return true;
+}
+
+bool allKnownNodesAcknowledgedFrequency(uint16_t reportFrequencyMinutes) {
+	if (reportFrequencyMinutes <= sysStatus.get_frequencyMinutes()) {
+		return true;
+	}
+
+	const JsonParserGeneratorRK::jsmntok_t *nodesArrayContainer;
+	if (!jp.getValueTokenByKey(jp.getOuterObject(), "nodes", nodesArrayContainer) || !nodesArrayContainer) {
+		return true;
+	}
+
+	for (int index = 0; index < nodesArrayContainer->size; index++) {
+		const JsonParserGeneratorRK::jsmntok_t *nodeObjectContainer = jp.getTokenByIndex(nodesArrayContainer, index);
+		if (!nodeObjectContainer) {
+			break;
+		}
+		const NodeFrequencyState nodeFrequencyState = readNodeFrequencyState(nodeObjectContainer);
+		if (nodeFrequencyState.nodeAcknowledgedFrequencyMinutes != reportFrequencyMinutes) {
+			return false;
+		}
+	}
+
+	return true;
+}
+
+void syncGatewayFrequencyWithBatteryBackoff(const GatewayBatteryBackoffState &backoffState) {
+	const uint16_t currentFrequencyMinutes = sysStatus.get_frequencyMinutes();
+	if (backoffState.reportFrequencyMinutes < currentFrequencyMinutes) {
+		if (currentFrequencyMinutes != backoffState.reportFrequencyMinutes) {
+			Log.info("FrequencyChange: gateway old=%u new=%u reason=BATTERY_BACKOFF", currentFrequencyMinutes, backoffState.reportFrequencyMinutes);
+			sysStatus.set_frequencyMinutes(backoffState.reportFrequencyMinutes);
+		}
+		if (sysStatus.get_updatedFrequencyMinutes() == backoffState.reportFrequencyMinutes) {
+			sysStatus.set_updatedFrequencyMinutes(0);
+		}
+		return;
+	}
+
+	if (backoffState.reportFrequencyMinutes > currentFrequencyMinutes && allKnownNodesAcknowledgedFrequency(backoffState.reportFrequencyMinutes)) {
+		Log.info("FrequencyChange: gateway old=%u new=%u reason=BATTERY_BACKOFF", currentFrequencyMinutes, backoffState.reportFrequencyMinutes);
+		sysStatus.set_frequencyMinutes(backoffState.reportFrequencyMinutes);
+		if (sysStatus.get_updatedFrequencyMinutes() == backoffState.reportFrequencyMinutes) {
+			sysStatus.set_updatedFrequencyMinutes(0);
+		}
+	}
+	else if (backoffState.reportFrequencyMinutes == currentFrequencyMinutes && sysStatus.get_updatedFrequencyMinutes() == backoffState.reportFrequencyMinutes) {
+		sysStatus.set_updatedFrequencyMinutes(0);
+	}
+}
+
+GatewayBatteryBackoffState computeGatewayBatteryBackoffState() {
+	const GatewayBatteryTelemetry telemetry = GatewayPlatform::lastBatteryTelemetry();
+	if (telemetry.available) {
+		batteryBackoffLastSoc = telemetry.soc;
+		batteryBackoffLevel = batteryBackoffLevelForSoc(telemetry.soc, batteryBackoffLevel);
+	}
+
+	GatewayBatteryBackoffState state = {
+		batteryBackoffLevel,
+		batteryBackoffLastSoc,
+		batteryBackoffFrequencyForLevel(batteryBackoffLevel),
+		batteryBackoffListenWindowForLevel(batteryBackoffLevel)
+	};
+	syncGatewayFrequencyWithBatteryBackoff(state);
+	return state;
+}
+
+uint16_t gatewayDesiredReportFrequencyMinutes() {
+	const uint16_t pendingFrequencyMinutes = sysStatus.get_updatedFrequencyMinutes();
+	if (pendingFrequencyMinutes > 0) {
+		return pendingFrequencyMinutes;
+	}
+	return computeGatewayBatteryBackoffState().reportFrequencyMinutes;
+}
+
 bool preserveCorruptNodeDb(const char *json, size_t len) {
 	if (!json) {
 		return false;
@@ -166,12 +338,12 @@ uint16_t minutesUntilNextOpening() {
 
 GatewayScheduleHint gatewayScheduleHint() {
 	if (!Time.isValid()) {
-		return {sysStatus.get_frequencyMinutes(), true};
+		return {gatewayDesiredReportFrequencyMinutes(), true};
 	}
 	if (shouldSendClosedHoursHint()) {
 		return {minutesUntilNextOpening(), false};
 	}
-	return {sysStatus.get_frequencyMinutes(), true};
+	return {gatewayDesiredReportFrequencyMinutes(), true};
 }
 
 time_t gatewayAckTimestamp() {
@@ -209,6 +381,10 @@ void logPersistWindow(const char *context, uint32_t elapsedMs, const PersistSnap
 }
 
 } // anonymous namespace
+
+GatewayBatteryBackoffState gatewayBatteryBackoffState() {
+	return computeGatewayBatteryBackoffState();
+}
 
 static const char *rhModeName(RHGenericDriver::RHMode mode) __attribute__((unused));
 
@@ -417,6 +593,8 @@ void LoRA_Functions::sleepLoRaRadio() {
 }
 
 void LoRA_Functions::logGatewayStateEntry() {
+	const GatewayBatteryBackoffState state = gatewayBatteryBackoffState();
+	Log.info("BatteryBackoff: level=%u soc=%.0f reportFrequency=%u listenWindowSeconds=%u", state.level, state.soc, state.reportFrequencyMinutes, state.listenWindowSeconds);
 	#if !LORA_DIAGNOSTICS
 	return;
 	#else
@@ -524,12 +702,7 @@ bool LoRA_Functions::listenForLoRAMessageGateway() {
 		else if (lora_state == JOIN_REQ) {if(!LoRA_Functions::instance().decipherJoinRequestGateway()) return false;}
 		else {Log.info("Invalid message flag, returning"); return false;}
 
-		// At this point the message is valid and has been deciphered - now we need to send a response - if there is a change in freuqency, it is applied here
-		if (sysStatus.get_updatedFrequencyMinutes() > 0) {								// If we are to change the update frequency, we need to tell the nodes (or at least one node) about it.
-			sysStatus.set_frequencyMinutes(sysStatus.get_updatedFrequencyMinutes());// This was the temporary value from the particle function
-			sysStatus.set_updatedFrequencyMinutes(0);
-			Log.info("We are updating the publish frequency to %i minutes", sysStatus.get_frequencyMinutes());
-		}
+		// At this point the message is valid and has been deciphered - the response will carry the pending desired frequency.
 		// The response will be specific to the message type
 		if (lora_state == DATA_ACK) { if(LoRA_Functions::instance().acknowledgeDataReportGateway()) return true;}
 		else if (lora_state == JOIN_ACK) { if(LoRA_Functions::instance().acknowledgeJoinRequestGateway()) return true;}
@@ -561,6 +734,7 @@ bool LoRA_Functions::decipherDataReportGateway() {			// Receives the data report
 
 bool LoRA_Functions::acknowledgeDataReportGateway() { 		// This is a response to a data message 
 	char messageString[128];
+	const GatewayBatteryBackoffState backoffState = gatewayBatteryBackoffState();
 	const GatewayScheduleHint scheduleHint = gatewayScheduleHint();
 	const time_t ackTime = gatewayAckTimestamp();
 	byte pendingAlert = 0;
@@ -613,10 +787,19 @@ bool LoRA_Functions::acknowledgeDataReportGateway() { 		// This is a response to
 		if (current.get_nodeNumber() != 11) {
 			const system_tick_t persistStart = millis();
 			const PersistSnapshot beforePersist = capturePersistSnapshot();
+			const JsonParserGeneratorRK::jsmntok_t *nodesArrayContainer;
+			jp.getValueTokenByKey(jp.getOuterObject(), "nodes", nodesArrayContainer);
+			const JsonParserGeneratorRK::jsmntok_t *nodeObjectContainer = jp.getTokenByIndex(nodesArrayContainer, current.get_nodeNumber() - 1);
+			const NodeFrequencyState nodeFrequencyState = readNodeFrequencyState(nodeObjectContainer);
+			if (nodeFrequencyState.nodeAcknowledgedFrequencyMinutes != scheduleHint.frequencyMinutes) {
+				Log.info("FrequencyChange: node=%d old=%u new=%u reason=BATTERY_BACKOFF", current.get_nodeNumber(), nodeFrequencyState.nodeAcknowledgedFrequencyMinutes, scheduleHint.frequencyMinutes);
+			}
 			if (clearPendingAlert) {
 				LoRA_Functions::changeAlert(current.get_nodeNumber(), 0, false);
 			}
 			LoRA_Functions::instance().nodeUpdate(current.get_nodeNumber(), successPercent, false);
+			writeNodeFrequencyState(nodeObjectContainer, scheduleHint.frequencyMinutes, scheduleHint.frequencyMinutes, true);
+			syncGatewayFrequencyWithBatteryBackoff(backoffState);
 			logPersistWindow("dataAckPost", millis() - persistStart, beforePersist);
 		}
 
@@ -661,6 +844,7 @@ bool LoRA_Functions::decipherJoinRequestGateway() {			// Ths only question here 
 
 bool LoRA_Functions::acknowledgeJoinRequestGateway() {
 	char messageString[128];
+	const GatewayBatteryBackoffState backoffState = gatewayBatteryBackoffState();
 	const GatewayScheduleHint scheduleHint = gatewayScheduleHint();
 	const time_t ackTime = gatewayAckTimestamp();
 	Log.info("Acknowledge Join Request");
@@ -686,6 +870,15 @@ bool LoRA_Functions::acknowledgeJoinRequestGateway() {
 	if (manager.sendtoWait(buf, 11, nodeAddress, JOIN_ACK) == RH_ROUTER_ERROR_NONE) {
 		current.set_tempNodeNumber(0);								// Temp no longer needed
 		digitalWrite(BLUE_LED,LOW);
+		const JsonParserGeneratorRK::jsmntok_t *nodesArrayContainer;
+		jp.getValueTokenByKey(jp.getOuterObject(), "nodes", nodesArrayContainer);
+		const JsonParserGeneratorRK::jsmntok_t *nodeObjectContainer = jp.getTokenByIndex(nodesArrayContainer, current.get_nodeNumber() - 1);
+		const NodeFrequencyState nodeFrequencyState = readNodeFrequencyState(nodeObjectContainer);
+		if (nodeFrequencyState.nodeAcknowledgedFrequencyMinutes != scheduleHint.frequencyMinutes) {
+			Log.info("FrequencyChange: node=%d old=%u new=%u reason=BATTERY_BACKOFF", current.get_nodeNumber(), nodeFrequencyState.nodeAcknowledgedFrequencyMinutes, scheduleHint.frequencyMinutes);
+		}
+		writeNodeFrequencyState(nodeObjectContainer, scheduleHint.frequencyMinutes, scheduleHint.frequencyMinutes, true);
+		syncGatewayFrequencyWithBatteryBackoff(backoffState);
 		snprintf(messageString,sizeof(messageString),"Node %d joined with sensorType %s, alert %d and RSSI / SNR of %d / %d", nodeAddress, (buf[10] ==0)? "car":"person",current.get_alertCodeNode(), current.get_RSSI(), current.get_SNR());
 		Log.info("%s", messageString);
 		if (Particle.connected()) Particle.publish("status", messageString,PRIVATE);
@@ -762,6 +955,8 @@ uint8_t LoRA_Functions::findNodeNumber(const char* deviceID, int radioID, bool p
 		mod.insertKeyValue("type", (int)3);									// This is a temp value that will be updated
 		mod.insertKeyValue("succ",(float)0.0);								// This is a temp value that will be updated
 		mod.insertKeyValue("pend",(int)0);
+			mod.insertKeyValue("desiredReportFrequency", (int)60);
+			mod.insertKeyValue("nodeAcknowledgedFrequency", (int)60);
 		mod.finishObjectOrArray();
 	mod.finish();
 

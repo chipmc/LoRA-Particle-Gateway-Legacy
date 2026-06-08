@@ -55,7 +55,7 @@ bool sysStatusData::validate(size_t dataSize) {
             Log.info("data not valid openTime=%d and closeTime=%d", sysStatus.get_openTime(), sysStatus.get_closeTime());
             valid = false;
         }
-        else if (sysStatus.get_frequencyMinutes() <=0 || sysStatus.get_frequencyMinutes() > 60) {
+        else if (!(sysStatus.get_frequencyMinutes() == 60 || sysStatus.get_frequencyMinutes() == 120 || sysStatus.get_frequencyMinutes() == 240 || sysStatus.get_frequencyMinutes() == 480)) {
             Log.info("data not valid frequency minutes =%d", sysStatus.get_frequencyMinutes());
             valid = false;
         }

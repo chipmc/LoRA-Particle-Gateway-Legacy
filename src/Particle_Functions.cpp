@@ -131,7 +131,7 @@ int Particle_Functions::jsonFunctionParser(String command) {
       // Format - function - freq, node - 0, variables - 2-60 (must be divisiable by two)
       // Test - {"cmd":[{"node":0,"var":"5","fn":"freq"}]}
       int tempValue = strtol(variable,&pEND,10);                       // Looks for the first integer and interprets it
-      if ((tempValue > 0) && (tempValue <= 60) && 60 % tempValue == 0) {
+      if ((tempValue > 0) && (tempValue <= 480) && (tempValue % 60 == 0)) {
         snprintf(messaging,sizeof(messaging),"Setting reporting frequency to %d minutes", tempValue);
         sysStatus.set_updatedFrequencyMinutes(tempValue);
       }

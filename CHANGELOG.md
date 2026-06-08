@@ -1,5 +1,9 @@
 # Changelog
 
+## v25.00 - 2026-06-08
+
+- Power back-off for low battery conditions.
+
 ## v23.00 - 2026-05-17
 
 - Reduced Gateway NodeDB persistence overhead by coalescing duplicate saves, keeping data-report bookkeeping off the ACK hot path, and preserving mirrored FRAM durability and repair behavior.

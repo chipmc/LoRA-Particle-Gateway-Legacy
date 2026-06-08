@@ -58,7 +58,15 @@ buf[29] sensorType			        // Identifies sensor type to Gateway
 #ifndef __LORA_FUNCTIONS_H
 #define __LORA_FUNCTIONS_H
 
+#include <stdint.h>
 #include "Particle.h"
+
+struct GatewayBatteryBackoffState {
+    uint8_t level;
+    float soc;
+    uint16_t reportFrequencyMinutes;
+    uint16_t listenWindowSeconds;
+};
 
 /**
  * This class is a singleton; you do not create one as a global, on the stack, or with new.
@@ -326,4 +334,6 @@ protected:
     static LoRA_Functions *_instance;
 
 };
+
+GatewayBatteryBackoffState gatewayBatteryBackoffState();
 #endif  /* __LORA_FUNCTIONS_H */

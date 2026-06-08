@@ -1,7 +1,6 @@
 /*
  * Project LoRA-Particle-Gateway
  * Description: This device will listen for data from client devices and forward the data to Particle via webhook
- * Author: Chip McClelland and Jeff Skarda
  * Date: 7-28-22
  */
 
@@ -38,6 +37,7 @@
 // v19.00 - Dual-platform Boron/Photon 2 gateway release with platform abstraction, closed-hours scheduling, P2 pin mapping, and connection diagnostics
 // v21.00 - Gateway production hardening release with FRAM repair/verification, normalized logging, battery telemetry, safe local config handling, and boot reset diagnostics
 // v23.00 - Release finalization with NodeDB save coalescing, ACK-path persistence reduction, compact persistence instrumentation, and RF9X modem-config compatibility build fix
+// v25.00 - Power back-off for low battery conditions
 
 // Particle Libraries
 #include "PublishQueuePosixRK.h"			        // https://github.com/rickkas7/PublishQueuePosixRK
@@ -400,7 +400,8 @@ void loop() {
 			else {															   // Awoke for time
 				current.set_openHours(isParkOpenNow());
 				if (current.get_openHours()) {
-					Log.info("Wake: hourly listening window start local=%s duration=%um", formatGatewayLocalClockTime(Time.now()).c_str(), DEFAULT_LORA_WINDOW);
+					const GatewayBatteryBackoffState backoffState = gatewayBatteryBackoffState();
+					Log.info("Wake: listening window start local=%s duration=%us level=%u", formatGatewayLocalClockTime(Time.now()).c_str(), backoffState.listenWindowSeconds, backoffState.level);
 				}
 				else {
 					Log.info("Wake: scheduled timer local=%s", formatGatewayLocalClockTime(Time.now()).c_str());
@@ -412,7 +413,7 @@ void loop() {
 
 		case LoRA_STATE: {														// Enter this state every reporting period and stay here for 5 minutes
 			static system_tick_t startLoRAWindow = 0;
-			static byte connectionWindow = 0;
+			static uint16_t connectionWindowSeconds = 0;
 			static system_tick_t lastLoRaDiagnosticLog = 0;
 
 			if (state != oldState) {
@@ -422,12 +423,12 @@ void loop() {
 				conv.withCurrentTime().convert();								// Get the time and convert to Local
 				current.set_openHours(isParkOpenNow());
 
-				if (sysStatus.get_connectivityMode() == 0) connectionWindow = DEFAULT_LORA_WINDOW;
-				else connectionWindow = STAY_CONNECTED;
+				if (sysStatus.get_connectivityMode() == 0) connectionWindowSeconds = gatewayBatteryBackoffState().listenWindowSeconds;
+				else connectionWindowSeconds = STAY_CONNECTED * 60U;
 
 				LoRA_Functions::instance().logGatewayStateEntry();
 
-				Log.info("Gateway is listening for %d minutes for LoRA messages and the park is %s (%d / %d / %d)", (sysStatus.get_connectivityMode() == 0) ? DEFAULT_LORA_WINDOW : STAY_CONNECTED, (current.get_openHours()) ? "open":"closed", conv.getLocalTimeHMS().hour, sysStatus.get_openTime(), sysStatus.get_closeTime());
+				Log.info("Gateway is listening for %u seconds for LoRA messages and the park is %s (%d / %d / %d)", connectionWindowSeconds, (current.get_openHours()) ? "open":"closed", conv.getLocalTimeHMS().hour, sysStatus.get_openTime(), sysStatus.get_closeTime());
 			} 
 
 			if ((millis() - lastLoRaDiagnosticLog) >= 15000UL) {
@@ -441,7 +442,7 @@ void loop() {
 				}
 			}
 
-				if ((millis() - startLoRAWindow) > (connectionWindow *60000UL)) { 					// Keeps us in listening mode for the specified windpw - then back to idle unless in test mode - keeps listening
+				if ((millis() - startLoRAWindow) > ((unsigned long)connectionWindowSeconds * 1000UL)) { 					// Keeps us in listening mode for the specified window - then back to idle unless in test mode - keeps listening
 				Log.info("Listening window over");
 				LoRA_Functions::instance().nodeConnectionsHealthy();							// Will see if any nodes checked in - if not - will reset
 				LoRA_Functions::instance().sleepLoRaRadio();									// Done with the LoRA phase - put the radio to sleep
