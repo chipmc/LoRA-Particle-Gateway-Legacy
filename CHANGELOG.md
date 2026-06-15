@@ -3,6 +3,9 @@
 ## v25.00 - 2026-06-08
 
 - Power back-off for low battery conditions.
+- Hardened gateway data-report decode with explicit signed/unsigned 16-bit helpers while preserving packet format, field order, checksums, and ACK structure.
+- Added LoRa diagnostics-gated decode trace logging of raw RSSI/SNR bytes and decoded values to verify signed handling without increasing normal log noise.
+- Reclassified expected NodeDB persistence latency (including ACK-window persistence) to non-critical logs, while retaining `PersistCrit` for clearly abnormal durations above 1000 ms.
 
 ## v23.00 - 2026-05-17
 

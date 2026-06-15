@@ -483,9 +483,9 @@ void currentStatusData::set_productVersion(uint16_t value) {
 namespace {
 
 const char *const EMPTY_NODE_DB_JSON = "{\"nodes\":[]}";
-const uint32_t NODE_DB_PERSIST_WARN_MS = 25;
-const uint32_t NODE_DB_PERSIST_STRONG_WARN_MS = 50;
-const uint32_t NODE_DB_PERSIST_CRITICAL_MS = 100;
+const uint32_t NODE_DB_PERSIST_INFO_MS = 250;
+const uint32_t NODE_DB_PERSIST_WARN_MS = 450;
+const uint32_t NODE_DB_PERSIST_CRITICAL_MS = 1000;
 const uint32_t NODE_DB_PERSIST_DAY_SECONDS = 86400;
 const uint32_t NODE_DB_PERSIST_BYTES_PER_SAVE = sizeof(nodeIDData::NodeData) * 2;
 
@@ -792,11 +792,11 @@ void nodeIDData::recordPersistSave(uint32_t mirrorDurationMs, uint32_t totalDura
     if (totalDurationMs > NODE_DB_PERSIST_CRITICAL_MS) {
         Log.error("PersistCrit: save=%lums mirror=%lums", (unsigned long)totalDurationMs, (unsigned long)mirrorDurationMs);
     }
-    else if (totalDurationMs > NODE_DB_PERSIST_STRONG_WARN_MS) {
+    else if (totalDurationMs > NODE_DB_PERSIST_WARN_MS) {
         Log.warn("PersistWarn: save=%lums mirror=%lums", (unsigned long)totalDurationMs, (unsigned long)mirrorDurationMs);
     }
-    else if (totalDurationMs > NODE_DB_PERSIST_WARN_MS) {
-        Log.warn("Persist: save=%lums mirror=%lums", (unsigned long)totalDurationMs, (unsigned long)mirrorDurationMs);
+    else if (totalDurationMs > NODE_DB_PERSIST_INFO_MS) {
+        Log.info("Persist: save=%lums mirror=%lums", (unsigned long)totalDurationMs, (unsigned long)mirrorDurationMs);
     }
 }
 

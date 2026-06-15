@@ -37,7 +37,7 @@
 // v19.00 - Dual-platform Boron/Photon 2 gateway release with platform abstraction, closed-hours scheduling, P2 pin mapping, and connection diagnostics
 // v21.00 - Gateway production hardening release with FRAM repair/verification, normalized logging, battery telemetry, safe local config handling, and boot reset diagnostics
 // v23.00 - Release finalization with NodeDB save coalescing, ACK-path persistence reduction, compact persistence instrumentation, and RF9X modem-config compatibility build fix
-// v25.00 - Power back-off for low battery conditions
+// v25.00 - Power back-off for low battery conditions, signed LoRa decode hardening, and persistence log severity tuning
 
 // Particle Libraries
 #include "PublishQueuePosixRK.h"			        // https://github.com/rickkas7/PublishQueuePosixRK
@@ -670,6 +670,8 @@ void publishWebhook(uint8_t nodeNumber) {
 		if (deviceID == "null") return;									// A webhook without a deviceID is worthless
 
 		float percentSuccess = ((current.get_successCount() * 1.0)/ current.get_messageCount())*100.0;
+		const int nodeRssi = (int)current.get_RSSI();
+		const int nodeSnr = (int)current.get_SNR();
 
 		snprintf(data, sizeof(data),
 			"{\"deviceid\":\"%s\", \"hourly\":%u, \"daily\":%u, \"sensortype\":%d, "
@@ -679,7 +681,7 @@ void publishWebhook(uint8_t nodeNumber) {
 			deviceID.c_str(), current.get_hourlyCount(), current.get_dailyCount(), current.get_sensorType(),
 			current.get_stateOfCharge(), gatewayBatteryContext(current.get_batteryState()),
 			current.get_internalTempC(), current.get_resetCount(), current.get_alertCodeNode(), current.get_nodeNumber(),
-			current.get_RSSI(), current.get_SNR(), current.get_hops(), current.get_messageCount(), percentSuccess,
+			nodeRssi, nodeSnr, current.get_hops(), current.get_messageCount(), percentSuccess,
 			endTimePeriod);
 		PublishQueuePosix::instance().publish("Ubidots-LoRA-Node-v1", data, PRIVATE | WITH_ACK);
 	}

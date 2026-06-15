@@ -65,9 +65,9 @@ void loraDio0DiagnosticISR();
 
 namespace {
 
-const uint32_t PRE_ACK_PERSIST_WARN_MS = 25;
-const uint32_t PRE_ACK_PERSIST_STRONG_WARN_MS = 50;
-const uint32_t PRE_ACK_PERSIST_CRITICAL_MS = 100;
+const uint32_t PRE_ACK_PERSIST_INFO_MS = 250;
+const uint32_t PRE_ACK_PERSIST_WARN_MS = 450;
+const uint32_t PRE_ACK_PERSIST_CRITICAL_MS = 1000;
 
 const char *const NODE_DB_BAD_PATH = "/usr/nodedb.bad";
 const char *const NODE_DB_BAD_TMP_PATH = "/usr/nodedb.bad.tmp";
@@ -88,6 +88,27 @@ struct NodeFrequencyState {
 	uint16_t desiredReportFrequencyMinutes;
 	uint16_t nodeAcknowledgedFrequencyMinutes;
 };
+
+constexpr uint16_t decodeUnsigned16FromBytes(uint8_t msb, uint8_t lsb) {
+	return (uint16_t)(((uint16_t)msb << 8) | (uint16_t)lsb);
+}
+
+constexpr int16_t decodeSigned16FromBytes(uint8_t msb, uint8_t lsb) {
+	return (int16_t)decodeUnsigned16FromBytes(msb, lsb);
+}
+
+uint16_t decodeUnsigned16At(const uint8_t *payload, uint8_t msbIndex, uint8_t lsbIndex) {
+	return decodeUnsigned16FromBytes(payload[msbIndex], payload[lsbIndex]);
+}
+
+int16_t decodeSigned16At(const uint8_t *payload, uint8_t msbIndex, uint8_t lsbIndex) {
+	return decodeSigned16FromBytes(payload[msbIndex], payload[lsbIndex]);
+}
+
+static_assert(decodeSigned16FromBytes(0xFF, 0xC7) == -57, "decodeSigned16FromBytes failed for -57");
+static_assert(decodeSigned16FromBytes(0xFF, 0xFF) == -1, "decodeSigned16FromBytes failed for -1");
+static_assert(decodeSigned16FromBytes(0x00, 0x00) == 0, "decodeSigned16FromBytes failed for 0");
+static_assert(decodeSigned16FromBytes(0x00, 0x0B) == 11, "decodeSigned16FromBytes failed for +11");
 
 const uint16_t GATEWAY_NORMAL_REPORT_FREQUENCY_MINUTES = 60;
 const uint16_t GATEWAY_LEVEL_1_REPORT_FREQUENCY_MINUTES = 120;
@@ -336,6 +357,28 @@ uint16_t minutesUntilNextOpening() {
 	return (uint16_t)max(1UL, (secondsUntilOpen + 59UL) / 60UL);
 }
 
+uint16_t minutesUntilNextGatewayWindow() {
+	// Calculate minutes until the next aligned gateway listening window.
+	// This ensures nodes wake at the gateway's listening schedule boundary
+	// rather than using a relative offset from their current time.
+	conv.withCurrentTime().convert();
+	const auto localTime = conv.getLocalTimeHMS();
+	
+	const uint16_t frequencyMinutes = gatewayDesiredReportFrequencyMinutes();
+	const unsigned long frequencySeconds = (unsigned long)frequencyMinutes * 60UL;
+	const unsigned long secondsSinceLocalMidnight = 
+		((unsigned long)localTime.hour * 3600UL) + 
+		((unsigned long)localTime.minute * 60UL) + 
+		(unsigned long)localTime.second;
+	
+	// Calculate seconds until next aligned boundary
+	const unsigned long nextBoundarySeconds = 
+		frequencySeconds - (secondsSinceLocalMidnight % frequencySeconds);
+	
+	// Convert to minutes, rounding up, never return 0
+	return (uint16_t)max(1UL, (nextBoundarySeconds + 59UL) / 60UL);
+}
+
 GatewayScheduleHint gatewayScheduleHint() {
 	if (!Time.isValid()) {
 		return {gatewayDesiredReportFrequencyMinutes(), true};
@@ -343,7 +386,8 @@ GatewayScheduleHint gatewayScheduleHint() {
 	if (shouldSendClosedHoursHint()) {
 		return {minutesUntilNextOpening(), false};
 	}
-	return {gatewayDesiredReportFrequencyMinutes(), true};
+	// Return actual minutes until next gateway window, not frequency
+	return {minutesUntilNextGatewayWindow(), true};
 }
 
 time_t gatewayAckTimestamp() {
@@ -369,14 +413,14 @@ void logPersistWindow(const char *context, uint32_t elapsedMs, const PersistSnap
 		return;
 	}
 
-	if (elapsedMs > PRE_ACK_PERSIST_CRITICAL_MS || saveDelta > 1) {
+	if (elapsedMs > PRE_ACK_PERSIST_CRITICAL_MS || after.lastMs > PRE_ACK_PERSIST_CRITICAL_MS || after.lastMirrorMs > PRE_ACK_PERSIST_CRITICAL_MS) {
 		Log.error("PersistCrit: ctx=%s preAck=%lums saves=%lu save=%ums mirror=%ums", context, (unsigned long)elapsedMs, (unsigned long)saveDelta, after.lastMs, after.lastMirrorMs);
 	}
-	else if (elapsedMs > PRE_ACK_PERSIST_STRONG_WARN_MS) {
+	else if (elapsedMs > PRE_ACK_PERSIST_WARN_MS || after.lastMs > PRE_ACK_PERSIST_WARN_MS || after.lastMirrorMs > PRE_ACK_PERSIST_WARN_MS || saveDelta > 1) {
 		Log.warn("PersistWarn: ctx=%s preAck=%lums saves=%lu save=%ums mirror=%ums", context, (unsigned long)elapsedMs, (unsigned long)saveDelta, after.lastMs, after.lastMirrorMs);
 	}
-	else if (elapsedMs > PRE_ACK_PERSIST_WARN_MS) {
-		Log.warn("Persist: ctx=%s preAck=%lums saves=%lu save=%ums mirror=%ums", context, (unsigned long)elapsedMs, (unsigned long)saveDelta, after.lastMs, after.lastMirrorMs);
+	else if (elapsedMs > PRE_ACK_PERSIST_INFO_MS || after.lastMs > PRE_ACK_PERSIST_INFO_MS || after.lastMirrorMs > PRE_ACK_PERSIST_INFO_MS) {
+		Log.info("Persist: ctx=%s preAck=%lums saves=%lu save=%ums mirror=%ums", context, (unsigned long)elapsedMs, (unsigned long)saveDelta, after.lastMs, after.lastMirrorMs);
 	}
 }
 
@@ -671,16 +715,18 @@ bool LoRA_Functions::listenForLoRAMessageGateway() {
 	uint8_t hops;
 	if (manager.recvfromAck(buf, &len, &from, &dest, &id, &messageFlag, &hops)) {	// We have received a message - need to validate it
 		LORA_DIAG_LOG("LoRa diag recvfromAck: ok from=%u to=%u id=%u flags=0x%02x hops=%u rssi=%d snr=%d", from, dest, id, messageFlag, hops, driver.lastRssi(), driver.lastSNR());
+		const uint16_t packetMagic = decodeUnsigned16At(buf, 0, 1);
+		const uint16_t packetNodeId = decodeUnsigned16At(buf, 2, 3);
 
 		// First we will validate that this node belongs in this network by checking the magic number
-		if (!((buf[0] << 8 | buf[1]) == sysStatus.get_magicNumber())) {
-			Log.info("Node %d message magic number of %d did not match the Magic Number in memory %d - Ignoring", current.get_nodeNumber(), (buf[0] << 8 | buf[1]), sysStatus.get_magicNumber());
+		if (!(packetMagic == sysStatus.get_magicNumber())) {
+			Log.info("Node %d message magic number of %u did not match the Magic Number in memory %u - Ignoring", current.get_nodeNumber(), packetMagic, sysStatus.get_magicNumber());
 			return false;
 		}
 		current.set_nodeNumber(from);												// Captures the nodeNumber
 		current.set_tempNodeNumber(0);											// Clear for new response
 		current.set_hops(hops);													// How many hops to get here
-		current.set_nodeID(buf[2] << 8 | buf[3]);								// Captures the nodeID for Data or Alert reports
+		current.set_nodeID(packetNodeId);									// Captures the nodeID for Data or Alert reports
 		lora_state = (LoRA_State)(0x0F & messageFlag);								// Strip out the overhead byte to get the message flag
 		if (lora_state == DATA_RPT) {
 			LORA_DIAG_LOG("LoRa diag data_rpt: node=%u id=%u hops=%u rssi=%d snr=%d", from, current.get_nodeID(), hops, driver.lastRssi(), driver.lastSNR());
@@ -716,8 +762,13 @@ bool LoRA_Functions::listenForLoRAMessageGateway() {
 // These are the receive and respond messages for data reports
 
 bool LoRA_Functions::decipherDataReportGateway() {			// Receives the data report and loads results into current object for reporting
-	current.set_hourlyCount(buf[4] << 8 | buf[5]);
-	current.set_dailyCount(buf[6] << 8 | buf[7]);
+	const uint16_t hourlyCount = decodeUnsigned16At(buf, 4, 5);
+	const uint16_t dailyCount = decodeUnsigned16At(buf, 6, 7);
+	const int16_t nodeRssi = decodeSigned16At(buf, 15, 16);
+	const int16_t nodeSnr = decodeSigned16At(buf, 17, 18);
+
+	current.set_hourlyCount(hourlyCount);
+	current.set_dailyCount(dailyCount);
 	current.set_sensorType(buf[8]);
 	current.set_internalTempC(buf[9]);
 	current.set_stateOfCharge(buf[10]);
@@ -725,8 +776,10 @@ bool LoRA_Functions::decipherDataReportGateway() {			// Receives the data report
 	current.set_resetCount(buf[12]);
 	current.set_messageCount(buf[13]);
 	current.set_successCount(buf[14]);
-	current.set_RSSI(buf[15] << 8 | buf[16]);				// These values are from the node based on the last successful data report
-	current.set_SNR(buf[17] << 8 | buf[18]);
+	current.set_RSSI(nodeRssi);										// These values are from the node based on the last successful data report
+	current.set_SNR(nodeSnr);
+
+	LORA_DIAG_LOG("LoRa diag node decode: node=%u msg=%u rawRSSI=%02x%02x rawSNR=%02x%02x decRSSI=%d decSNR=%d temp=%d soc=%.0f battState=%u hourly=%u daily=%u hops=%u", current.get_nodeNumber(), current.get_messageCount(), buf[15], buf[16], buf[17], buf[18], (int)nodeRssi, (int)nodeSnr, (int)current.get_internalTempC(), current.get_stateOfCharge(), (unsigned)current.get_batteryState(), hourlyCount, dailyCount, current.get_hops());
 
 	lora_state = DATA_ACK;		// Prepare to respond
 	return true;
@@ -803,7 +856,9 @@ bool LoRA_Functions::acknowledgeDataReportGateway() { 		// This is a response to
 			logPersistWindow("dataAckPost", millis() - persistStart, beforePersist);
 		}
 
-		snprintf(messageString,sizeof(messageString),"Node %d data report %d acknowledged with alert %d, next window %s in %u minutes, and RSSI / SNR of %d / %d", current.get_nodeNumber(), buf[11], buf[8], buf[10] ? "open" : "closed", (unsigned)((buf[6] << 8) | buf[7]), current.get_RSSI(), current.get_SNR());
+		const int nodeRssi = (int)current.get_RSSI();
+		const int nodeSnr = (int)current.get_SNR();
+		snprintf(messageString,sizeof(messageString),"Node %d data report %d acknowledged with alert %d, next window %s in %u minutes, and RSSI / SNR of %d / %d", current.get_nodeNumber(), buf[11], buf[8], buf[10] ? "open" : "closed", (unsigned)decodeUnsigned16At(buf, 6, 7), nodeRssi, nodeSnr);
 		Log.info("%s", messageString);
 		if (Particle.connected()) Particle.publish("status", messageString,PRIVATE);
 		return true;
@@ -879,7 +934,9 @@ bool LoRA_Functions::acknowledgeJoinRequestGateway() {
 		}
 		writeNodeFrequencyState(nodeObjectContainer, scheduleHint.frequencyMinutes, scheduleHint.frequencyMinutes, true);
 		syncGatewayFrequencyWithBatteryBackoff(backoffState);
-		snprintf(messageString,sizeof(messageString),"Node %d joined with sensorType %s, alert %d and RSSI / SNR of %d / %d", nodeAddress, (buf[10] ==0)? "car":"person",current.get_alertCodeNode(), current.get_RSSI(), current.get_SNR());
+		const int nodeRssi = (int)current.get_RSSI();
+		const int nodeSnr = (int)current.get_SNR();
+		snprintf(messageString,sizeof(messageString),"Node %d joined with sensorType %s, alert %d and RSSI / SNR of %d / %d", nodeAddress, (buf[10] ==0)? "car":"person",current.get_alertCodeNode(), nodeRssi, nodeSnr);
 		Log.info("%s", messageString);
 		if (Particle.connected()) Particle.publish("status", messageString,PRIVATE);
 		return true;
