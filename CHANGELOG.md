@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+- Clarified Gateway/Node v26/v27 protocol semantics: ACK bytes 6-7 carry scheduleIntervalMinutes with dual semantics controlled by openHours flag (byte 10).
+- During open hours: scheduleIntervalMinutes = reporting cadence for boundary-aligned node scheduling.
+- During closed hours: scheduleIntervalMinutes = minutes until next opening for relative node sleep.
+- Updated protocol documentation to use scheduleIntervalMinutes terminology instead of ambiguous frequencyMinutes.
+- Preserved functional behavior: Gateway sends time offsets during closed hours, cadence during open hours.
+- Added clarifying comments to GatewayScheduleHint and NodeFrequencyState structs noting legacy field naming.
+
 ## v25.00 - 2026-06-08
 
 - Power back-off for low battery conditions.
