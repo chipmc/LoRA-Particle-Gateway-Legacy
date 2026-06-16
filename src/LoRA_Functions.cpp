@@ -33,7 +33,7 @@ LoRA_Functions::~LoRA_Functions() {
 // ******** JSON Object - Scoped to LoRA_Functions Class        ***********
 // ************************************************************************
 // JSON for node data
-JsonParserStatic<1024, 50> jp;						// Make this global - reduce possibility of fragmentation
+JsonParserStatic<nodeIDData::NODEDB_JSON_BYTES, nodeIDData::NODEDB_JSON_TOKENS> jp;		// Global parser for 10-node support
 
 
 // ************************************************************************
@@ -208,7 +208,10 @@ bool writeNodeFrequencyState(const JsonParserGeneratorRK::jsmntok_t *nodeObjectC
 	mod.insertOrUpdateKeyValue(nodeObjectContainer, "desiredReportFrequency", desiredReportFrequencyMinutes);
 	mod.insertOrUpdateKeyValue(nodeObjectContainer, "nodeAcknowledgedFrequency", nodeAcknowledgedFrequencyMinutes);
 	if (persistNow) {
-		nodeDatabase.saveNodeIDJson(jp.getBuffer());
+		if (!nodeDatabase.saveNodeIDJson(jp.getBuffer())) {
+			Log.error("NodeDB save failed in writeNodeFrequencyState");
+			return false;
+		}
 	}
 	return true;
 }
@@ -621,6 +624,12 @@ bool LoRA_Functions::setup(bool gatewayID) {
 		Log.info("NodeDB loaded: nodes=%u", nodeDatabaseCount());
 	}
 	else {
+		// Log concise invalid-JSON diagnostics
+		const size_t previewLen = min(nodeDbLen, (size_t)60);
+		char preview[61];
+		strncpy(preview, nodeDbJson.c_str(), previewLen);
+		preview[previewLen] = '\0';
+		Log.error("NodeDB load failed: len=%u preview=%s", (unsigned)nodeDbLen, preview);
 		preserveCorruptNodeDb(nodeDbJson.c_str(), nodeDbLen);
 		if (nodeDatabase.resetNodeIDs()) {
 			const String repairedNodeDbJson = nodeDatabase.get_nodeIDJson();
@@ -628,6 +637,12 @@ bool LoRA_Functions::setup(bool gatewayID) {
 			if (parseNodeDatabase(repairedNodeDbJson, repairedNodeDbLen, true)) {
 				Log.info("NodeDB loaded: nodes=%u", nodeDatabaseCount());
 			}
+			else {
+				Log.error("NodeDB repair failed: empty database did not parse");
+			}
+		}
+		else {
+			Log.error("NodeDB repair failed: resetNodeIDs returned false");
 		}
 	}
 	return true;
@@ -955,7 +970,9 @@ bool LoRA_Functions::acknowledgeJoinRequestGateway() {
 		if (nodeFrequencyState.nodeAcknowledgedFrequencyMinutes != scheduleHint.frequencyMinutes) {
 			Log.info("FrequencyChange: node=%d old=%u new=%u reason=BATTERY_BACKOFF", current.get_nodeNumber(), nodeFrequencyState.nodeAcknowledgedFrequencyMinutes, scheduleHint.frequencyMinutes);
 		}
-		writeNodeFrequencyState(nodeObjectContainer, scheduleHint.frequencyMinutes, scheduleHint.frequencyMinutes, true);
+		if (!writeNodeFrequencyState(nodeObjectContainer, scheduleHint.frequencyMinutes, scheduleHint.frequencyMinutes, true)) {
+			Log.error("NodeDB frequency update failed in JOIN_ACK for node %d", current.get_nodeNumber());
+		}
 		syncGatewayFrequencyWithBatteryBackoff(backoffState);
 		const int nodeRssi = (int)current.get_RSSI();
 		const int nodeSnr = (int)current.get_SNR();
@@ -1041,7 +1058,15 @@ uint8_t LoRA_Functions::findNodeNumber(const char* deviceID, int radioID, bool p
 	mod.finish();
 
 	if (persistNow) {
-		nodeDatabase.saveNodeIDJson(jp.getBuffer());
+		if (!nodeDatabase.saveNodeIDJson(jp.getBuffer())) {
+			Log.error("NodeDB save failed in findNodeNumber for node %d", index);
+			// Reload from FRAM to restore jp state after mutation
+			const String restoredJson = nodeDatabase.get_nodeIDJson();
+			jp.clear();
+			jp.addString(restoredJson);
+			jp.parse();
+			return 0; // Signal failure
+		}
 	}
 
 	return index;
@@ -1108,7 +1133,15 @@ bool LoRA_Functions::nodeUpdate(int nodeNumber, float successPercent, bool persi
 	mod.finish();
 
 	if (persistNow) {
-		nodeDatabase.saveNodeIDJson(jp.getBuffer());
+		if (!nodeDatabase.saveNodeIDJson(jp.getBuffer())) {
+			Log.error("NodeDB save failed in nodeUpdate for node %d", nodeNumber);
+			// Reload from FRAM to restore jp state after mutation
+			const String restoredJson = nodeDatabase.get_nodeIDJson();
+			jp.clear();
+			jp.addString(restoredJson);
+			jp.parse();
+			return false;
+		}
 	}
 	return true;
 }
@@ -1161,7 +1194,15 @@ bool LoRA_Functions::changeType(int nodeNumber, int newType, bool persistNow) {
 	mod.finish();
 
 	if (persistNow) {
-		nodeDatabase.saveNodeIDJson(jp.getBuffer());
+		if (!nodeDatabase.saveNodeIDJson(jp.getBuffer())) {
+			Log.error("NodeDB save failed in changeType for node %d", nodeNumber);
+			// Reload from FRAM to restore jp state after mutation
+			const String restoredJson = nodeDatabase.get_nodeIDJson();
+			jp.clear();
+			jp.addString(restoredJson);
+			jp.parse();
+			return false;
+		}
 	}
 
 	return true;
@@ -1214,7 +1255,15 @@ bool LoRA_Functions::changeAlert(int nodeNumber, int newAlert, bool persistNow) 
 	mod.finish();
 
 	if (persistNow) {
-		nodeDatabase.saveNodeIDJson(jp.getBuffer());
+		if (!nodeDatabase.saveNodeIDJson(jp.getBuffer())) {
+			Log.error("NodeDB save failed in changeAlert for node %d", nodeNumber);
+			// Reload from FRAM to restore jp state after mutation
+			const String restoredJson = nodeDatabase.get_nodeIDJson();
+			jp.clear();
+			jp.addString(restoredJson);
+			jp.parse();
+			return false;
+		}
 	}
 
 	return true;

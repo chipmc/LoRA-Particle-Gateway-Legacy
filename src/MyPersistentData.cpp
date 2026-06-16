@@ -3,6 +3,7 @@
 #include "StorageHelperRK.h"
 #include "GatewayPlatform.h"
 #include "MyPersistentData.h"
+#include "JsonParserGeneratorRK.h"
 
 
 MB85RC64 fram(Wire, 0);
@@ -489,6 +490,61 @@ const uint32_t NODE_DB_PERSIST_CRITICAL_MS = 1000;
 const uint32_t NODE_DB_PERSIST_DAY_SECONDS = 86400;
 const uint32_t NODE_DB_PERSIST_BYTES_PER_SAVE = sizeof(nodeIDData::NodeData) * 2;
 
+// File-scope validator parser for NodeDB validation (reused to avoid stack allocation)
+static JsonParserStatic<nodeIDData::NODEDB_JSON_BYTES, nodeIDData::NODEDB_JSON_TOKENS> nodeDbValidator;
+
+/**
+ * Validate NodeDB JSON candidate before writing to FRAM.
+ * Checks both syntax and NodeDB shape (root object with "nodes" array).
+ * Enforces NODEDB_MAX_NODES limit on nodes array size.
+ * Uses same parser limits as operational parser (1024 bytes, 256 tokens for 10 nodes).
+ * Returns true if valid, false otherwise.
+ */
+bool validateNodeDbJsonCandidate(const char *str, size_t len) {
+	if (!str || len == 0) {
+		return false;
+	}
+	// Reuse file-scope parser to avoid stack allocation
+	nodeDbValidator.clear();
+	const bool added = nodeDbValidator.addString(str);
+	if (!added) {
+		Log.error("NodeDB validation failed: addString rejected len=%u", (unsigned)len);
+		return false;
+	}
+	const bool parsed = nodeDbValidator.parse();
+	if (!parsed) {
+		// Log a sanitized preview to help diagnose malformed JSON
+		const size_t previewLen = min(len, (size_t)60);
+		char preview[61];
+		strncpy(preview, str, previewLen);
+		preview[previewLen] = '\0';
+		Log.error("NodeDB validation failed: parse rejected len=%u preview=%s", (unsigned)len, preview);
+		return false;
+	}
+	// Verify NodeDB shape: root must be object with "nodes" array
+	const JsonParserGeneratorRK::jsmntok_t *outerObject = nodeDbValidator.getOuterObject();
+	if (!outerObject || outerObject->type != JsonParserGeneratorRK::JSMN_OBJECT) {
+		Log.error("NodeDB validation failed: root is not an object");
+		return false;
+	}
+	const JsonParserGeneratorRK::jsmntok_t *nodesArray = nullptr;
+	if (!nodeDbValidator.getValueTokenByKey(outerObject, "nodes", nodesArray) || !nodesArray) {
+		Log.error("NodeDB validation failed: missing 'nodes' key");
+		return false;
+	}
+	if (nodesArray->type != JsonParserGeneratorRK::JSMN_ARRAY) {
+		Log.error("NodeDB validation failed: 'nodes' is not an array");
+		return false;
+	}
+	// Enforce NODEDB_MAX_NODES limit
+	const int nodeCount = nodesArray->size;
+	if (nodeCount > (int)nodeIDData::NODEDB_MAX_NODES) {
+		Log.error("NodeDB validation failed: nodes array has %d elements, exceeds max %d", nodeCount, (int)nodeIDData::NODEDB_MAX_NODES);
+		return false;
+	}
+	return true;
+}
+
 bool bufferIsFilledWith(const uint8_t *buffer, size_t length, uint8_t value) {
     for (size_t index = 0; index < length; index++) {
         if (buffer[index] != value) {
@@ -689,9 +745,16 @@ bool nodeIDData::saveNodeIDJson(const char *str, bool force) {
         return false;
     }
 
+    // Defensive: validate JSON before writing to FRAM
+    if (!validateNodeDbJsonCandidate(str, jsonLength)) {
+        Log.error("NodeDB save rejected: JSON validation failed len=%u", (unsigned)jsonLength);
+        // Note: Global jp may be mutated. Callers should reload from FRAM if needed.
+        return false;
+    }
+
     const bool hadPendingPersist = hasPendingPersist();
     if (!set_nodeIDJson(str)) {
-        Log.error("NodeDB save rejected: len=%u", (unsigned)jsonLength);
+        Log.error("NodeDB save rejected: set_nodeIDJson failed len=%u", (unsigned)jsonLength);
         return false;
     }
 
@@ -703,6 +766,10 @@ bool nodeIDData::saveNodeIDJson(const char *str, bool force) {
     }
 
     flush(true);
+    if (hasPendingPersist()) {
+        Log.error("NodeDB atomic save failed: flush did not clear dirty flag");
+        return false;
+    }
     if (hadPendingPersist || hasPendingPersist() == false) {
         Log.info("NodeDB atomic save complete");
     }
