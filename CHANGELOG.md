@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v27.00 - 2026-06-16
 
 - Clarified Gateway/Node v26/v27 protocol semantics: ACK bytes 6-7 carry scheduleIntervalMinutes with dual semantics controlled by openHours flag (byte 10).
 - During open hours: scheduleIntervalMinutes = reporting cadence for boundary-aligned node scheduling.
