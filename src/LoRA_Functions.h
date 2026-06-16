@@ -28,11 +28,11 @@ buf[17-18] SNR                              // From the Node's perspective
 // Format of a data acknowledgement
 /*    
     buf[0 - 1 ] magicNumber                 // Magic Number
-    buf[2 - 5 ] Time.now()                  // Set the time 
-    buf[6 - 7] frequencyMinutes             // Gateway scheduling hint for the node's next wake interval
+    buf[2 - 5 ] Time.now()                  // Gateway epoch time for node time sync
+    buf[6 - 7] scheduleIntervalMinutes      // Dual semantics: reporting cadence during open hours, time-offset during closed hours
     buf[8] alertCode                        // This lets the Gateway trigger an alert on the node - typically a join request
     buf[9] sensorType                       // Let's the Gateway reset the sensor if needed 
-    buf[10] openHours                        // From the Gateway to the node - should the next node window be treated as open?
+    buf[10] openHours                       // From the Gateway to the node - controls scheduleIntervalMinutes interpretation
     buf[11] message number                  // Parrot this back to see if it matches
 */
 
@@ -47,8 +47,8 @@ buf[29] sensorType			        // Identifies sensor type to Gateway
 // Format for a join acknowledgement
 /*
     buf[0 - 1 ]  magicNumber                // Magic Number
-    buf[2 - 5 ] Time.now()                  // Set the time 
-    buf[6 - 7] frequencyMinutes             // Gateway scheduling hint for the node's next wake interval  
+    buf[2 - 5 ] Time.now()                  // Gateway epoch time for node time sync
+    buf[6 - 7] scheduleIntervalMinutes      // Dual semantics: reporting cadence during open hours, time-offset during closed hours
     buf[8] alertCodeNode                   // Gateway can set an alert code here
     buf[9]  newNodeNumber                   // New Node Number for device
     buf[10]  sensorType				        // Gateway confirms sensor type

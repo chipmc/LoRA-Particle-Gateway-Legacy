@@ -500,6 +500,11 @@ public:
 	 */
 	void initialize();
 
+	// NodeDB JSON sizing constants for 10-node support
+	static constexpr size_t NODEDB_JSON_BYTES = 1024;   // Persisted storage size
+	static constexpr size_t NODEDB_JSON_TOKENS = 256;   // Parser token capacity for 10 nodes
+	static constexpr size_t NODEDB_MAX_NODES = 10;      // Maximum supported nodes
+
 
 	class NodeData {
 	public:
@@ -508,7 +513,7 @@ public:
 		// Your fields go here. Once you've added a field you cannot add fields
 		// (except at the end), insert fields, remove fields, change size of a field.
 		// Doing so will cause the data to be corrupted!
-		char nodeIDJson[1024];                             // JSON string that stores the nodeID data
+		char nodeIDJson[NODEDB_JSON_BYTES];                // JSON string that stores the nodeID data
 	};
 	NodeData nodeData;
 

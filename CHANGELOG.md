@@ -1,5 +1,32 @@
 # Changelog
 
+## v27.00 - 2026-06-16
+
+### Protocol Clarification
+- Clarified Gateway/Node v26/v27 protocol semantics: ACK bytes 6-7 carry scheduleIntervalMinutes with dual semantics controlled by openHours flag (byte 10).
+- During open hours: scheduleIntervalMinutes = reporting cadence for boundary-aligned node scheduling.
+- During closed hours: scheduleIntervalMinutes = minutes until next opening for relative node sleep.
+- Updated protocol documentation to use scheduleIntervalMinutes terminology instead of ambiguous frequencyMinutes.
+- Preserved functional behavior: Gateway sends time offsets during closed hours, cadence during open hours.
+- Added clarifying comments to GatewayScheduleHint and NodeFrequencyState structs noting legacy field naming.
+
+### NodeDB Persistence Hardening
+- Enhanced JSON validator to verify NodeDB shape (root object with "nodes" array) in addition to syntax.
+- Updated NodeDB parser sizing for 10-node support: 1024 bytes, 256 tokens (was 50 tokens).
+- Defined shared constants: NODEDB_JSON_BYTES=1024, NODEDB_JSON_TOKENS=256, NODEDB_MAX_NODES=10.
+- Matched validator token capacity to operational parser limits to avoid rejecting valid payloads.
+- Fixed mutation functions (findNodeNumber, nodeUpdate, changeType, changeAlert) to return failure when FRAM save fails.
+- Added writeNodeFrequencyState return value checks in DATA_ACK and JOIN_ACK paths with node-contextual logging.
+- Implemented jp state restoration from FRAM after save failure to maintain in-memory/persisted consistency.
+- Improved error visibility with concise diagnostics for invalid JSON loads (length + 60-char sanitized preview).
+- Enhanced saveNodeIDJson return path to detect flush failures via dirty-flag check.
+
+**Residual Risks:**
+- Validator allocates ~6KB stack (JsonParserStatic<1024,256>) during validation. P2 has sufficient stack but worth monitoring.
+- jp reload from FRAM after mutation is not atomic with the mutation operation.
+- ACK operations may partially succeed (e.g., nodeUpdate succeeds but frequency update fails; ACK sent anyway).
+- Non-persisted mutations may occur if force=false (deferred flush); global jp reflects changes not yet in FRAM.
+
 ## v25.00 - 2026-06-08
 
 - Power back-off for low battery conditions.

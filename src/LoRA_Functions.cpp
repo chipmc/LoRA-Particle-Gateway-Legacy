@@ -33,7 +33,7 @@ LoRA_Functions::~LoRA_Functions() {
 // ******** JSON Object - Scoped to LoRA_Functions Class        ***********
 // ************************************************************************
 // JSON for node data
-JsonParserStatic<1024, 50> jp;						// Make this global - reduce possibility of fragmentation
+JsonParserStatic<nodeIDData::NODEDB_JSON_BYTES, nodeIDData::NODEDB_JSON_TOKENS> jp;		// Global parser for 10-node support
 
 
 // ************************************************************************
@@ -79,14 +79,24 @@ struct PersistSnapshot {
 	uint16_t lastMirrorMs;
 };
 
+/**
+ * Gateway scheduling hint for ACK bytes 6-7 and 10.
+ * frequencyMinutes represents scheduleIntervalMinutes with dual semantics:
+ *   - During open hours: reporting cadence / frequencyMinutes
+ *   - During closed hours: minutes until next opening or next gateway window
+ */
 struct GatewayScheduleHint {
-	uint16_t frequencyMinutes;
+	uint16_t frequencyMinutes;  // Legacy name: actually scheduleIntervalMinutes
 	bool openHours;
 };
 
+/**
+ * Per-node frequency tracking in NodeDB.
+ * Field names are legacy; both store reporting cadence, not time offsets.
+ */
 struct NodeFrequencyState {
-	uint16_t desiredReportFrequencyMinutes;
-	uint16_t nodeAcknowledgedFrequencyMinutes;
+	uint16_t desiredReportFrequencyMinutes;      // Gateway's desired reporting cadence
+	uint16_t nodeAcknowledgedFrequencyMinutes;   // Last cadence acknowledged by node
 };
 
 constexpr uint16_t decodeUnsigned16FromBytes(uint8_t msb, uint8_t lsb) {
@@ -198,7 +208,10 @@ bool writeNodeFrequencyState(const JsonParserGeneratorRK::jsmntok_t *nodeObjectC
 	mod.insertOrUpdateKeyValue(nodeObjectContainer, "desiredReportFrequency", desiredReportFrequencyMinutes);
 	mod.insertOrUpdateKeyValue(nodeObjectContainer, "nodeAcknowledgedFrequency", nodeAcknowledgedFrequencyMinutes);
 	if (persistNow) {
-		nodeDatabase.saveNodeIDJson(jp.getBuffer());
+		if (!nodeDatabase.saveNodeIDJson(jp.getBuffer())) {
+			Log.error("NodeDB save failed in writeNodeFrequencyState");
+			return false;
+		}
 	}
 	return true;
 }
@@ -357,6 +370,10 @@ uint16_t minutesUntilNextOpening() {
 	return (uint16_t)max(1UL, (secondsUntilOpen + 59UL) / 60UL);
 }
 
+/**
+ * Calculate minutes until next aligned gateway listening window.
+ * Used in ACK bytes 6-7 during open hours for boundary-aligned scheduling.
+ */
 uint16_t minutesUntilNextGatewayWindow() {
 	// Calculate minutes until the next aligned gateway listening window.
 	// This ensures nodes wake at the gateway's listening schedule boundary
@@ -379,6 +396,13 @@ uint16_t minutesUntilNextGatewayWindow() {
 	return (uint16_t)max(1UL, (nextBoundarySeconds + 59UL) / 60UL);
 }
 
+/**
+ * Returns scheduleIntervalMinutes for ACK bytes 6-7.
+ * Dual semantics:
+ *   - During open hours: returns reporting cadence (minutesUntilNextGatewayWindow)
+ *   - During closed hours: returns minutes until next opening (minutesUntilNextOpening)
+ * Node uses openHours flag (byte 10) to interpret scheduleIntervalMinutes correctly.
+ */
 GatewayScheduleHint gatewayScheduleHint() {
 	if (!Time.isValid()) {
 		return {gatewayDesiredReportFrequencyMinutes(), true};
@@ -386,7 +410,7 @@ GatewayScheduleHint gatewayScheduleHint() {
 	if (shouldSendClosedHoursHint()) {
 		return {minutesUntilNextOpening(), false};
 	}
-	// Return actual minutes until next gateway window, not frequency
+	// Return actual minutes until next gateway window, not just frequency
 	return {minutesUntilNextGatewayWindow(), true};
 }
 
@@ -600,6 +624,12 @@ bool LoRA_Functions::setup(bool gatewayID) {
 		Log.info("NodeDB loaded: nodes=%u", nodeDatabaseCount());
 	}
 	else {
+		// Log concise invalid-JSON diagnostics
+		const size_t previewLen = min(nodeDbLen, (size_t)60);
+		char preview[61];
+		strncpy(preview, nodeDbJson.c_str(), previewLen);
+		preview[previewLen] = '\0';
+		Log.error("NodeDB load failed: len=%u preview=%s", (unsigned)nodeDbLen, preview);
 		preserveCorruptNodeDb(nodeDbJson.c_str(), nodeDbLen);
 		if (nodeDatabase.resetNodeIDs()) {
 			const String repairedNodeDbJson = nodeDatabase.get_nodeIDJson();
@@ -607,6 +637,12 @@ bool LoRA_Functions::setup(bool gatewayID) {
 			if (parseNodeDatabase(repairedNodeDbJson, repairedNodeDbLen, true)) {
 				Log.info("NodeDB loaded: nodes=%u", nodeDatabaseCount());
 			}
+			else {
+				Log.error("NodeDB repair failed: empty database did not parse");
+			}
+		}
+		else {
+			Log.error("NodeDB repair failed: resetNodeIDs returned false");
 		}
 	}
 	return true;
@@ -796,7 +832,8 @@ bool LoRA_Functions::acknowledgeDataReportGateway() { 		// This is a response to
 
 	// buf[0] - buf[1] is magic number - processed above
 	encodeGatewayAckTimestamp(buf, ackTime);
-	buf[6] = highByte(scheduleHint.frequencyMinutes);	// Frequency of reports set by the gateway
+	// ACK bytes 6-7: scheduleIntervalMinutes (cadence during open hours, time-offset during closed)
+	buf[6] = highByte(scheduleHint.frequencyMinutes);
 	buf[7] = lowByte(scheduleHint.frequencyMinutes);	
 	// The next few bytes of the response will depend on whether the node is configured or not
 	if (current.get_nodeNumber() == 11) {			// This is a data report from an unconfigured node - need to tell it to rejoin
@@ -858,7 +895,7 @@ bool LoRA_Functions::acknowledgeDataReportGateway() { 		// This is a response to
 
 		const int nodeRssi = (int)current.get_RSSI();
 		const int nodeSnr = (int)current.get_SNR();
-		snprintf(messageString,sizeof(messageString),"Node %d data report %d acknowledged with alert %d, next window %s in %u minutes, and RSSI / SNR of %d / %d", current.get_nodeNumber(), buf[11], buf[8], buf[10] ? "open" : "closed", (unsigned)decodeUnsigned16At(buf, 6, 7), nodeRssi, nodeSnr);
+		snprintf(messageString,sizeof(messageString),"Node %d data report %d acknowledged with alert %d, %s hours, scheduleInterval %u min, RSSI/SNR %d/%d", current.get_nodeNumber(), buf[11], buf[8], buf[10] ? "open" : "closed", (unsigned)decodeUnsigned16At(buf, 6, 7), nodeRssi, nodeSnr);
 		Log.info("%s", messageString);
 		if (Particle.connected()) Particle.publish("status", messageString,PRIVATE);
 		return true;
@@ -909,7 +946,8 @@ bool LoRA_Functions::acknowledgeJoinRequestGateway() {
 	buf[0] = highByte(sysStatus.get_magicNumber());					// Magic number - so you can trust me
 	buf[1] = lowByte(sysStatus.get_magicNumber());					// Magic number - so you can trust me
 	encodeGatewayAckTimestamp(buf, ackTime);
-	buf[6] = highByte(scheduleHint.frequencyMinutes);			// Frequency of reports - for Gateways
+	// ACK bytes 6-7: scheduleIntervalMinutes (cadence during open hours, time-offset during closed)
+	buf[6] = highByte(scheduleHint.frequencyMinutes);
 	buf[7] = lowByte(scheduleHint.frequencyMinutes);	
 	buf[8] = (current.get_nodeNumber() != 11) ?  0 : 1;				// Clear the alert code for the node unless the nodeNumber process failed
 	buf[9] = current.get_nodeNumber();								
@@ -932,7 +970,9 @@ bool LoRA_Functions::acknowledgeJoinRequestGateway() {
 		if (nodeFrequencyState.nodeAcknowledgedFrequencyMinutes != scheduleHint.frequencyMinutes) {
 			Log.info("FrequencyChange: node=%d old=%u new=%u reason=BATTERY_BACKOFF", current.get_nodeNumber(), nodeFrequencyState.nodeAcknowledgedFrequencyMinutes, scheduleHint.frequencyMinutes);
 		}
-		writeNodeFrequencyState(nodeObjectContainer, scheduleHint.frequencyMinutes, scheduleHint.frequencyMinutes, true);
+		if (!writeNodeFrequencyState(nodeObjectContainer, scheduleHint.frequencyMinutes, scheduleHint.frequencyMinutes, true)) {
+			Log.error("NodeDB frequency update failed in JOIN_ACK for node %d", current.get_nodeNumber());
+		}
 		syncGatewayFrequencyWithBatteryBackoff(backoffState);
 		const int nodeRssi = (int)current.get_RSSI();
 		const int nodeSnr = (int)current.get_SNR();
@@ -1018,7 +1058,15 @@ uint8_t LoRA_Functions::findNodeNumber(const char* deviceID, int radioID, bool p
 	mod.finish();
 
 	if (persistNow) {
-		nodeDatabase.saveNodeIDJson(jp.getBuffer());
+		if (!nodeDatabase.saveNodeIDJson(jp.getBuffer())) {
+			Log.error("NodeDB save failed in findNodeNumber for node %d", index);
+			// Reload from FRAM to restore jp state after mutation
+			const String restoredJson = nodeDatabase.get_nodeIDJson();
+			jp.clear();
+			jp.addString(restoredJson);
+			jp.parse();
+			return 0; // Signal failure
+		}
 	}
 
 	return index;
@@ -1085,7 +1133,15 @@ bool LoRA_Functions::nodeUpdate(int nodeNumber, float successPercent, bool persi
 	mod.finish();
 
 	if (persistNow) {
-		nodeDatabase.saveNodeIDJson(jp.getBuffer());
+		if (!nodeDatabase.saveNodeIDJson(jp.getBuffer())) {
+			Log.error("NodeDB save failed in nodeUpdate for node %d", nodeNumber);
+			// Reload from FRAM to restore jp state after mutation
+			const String restoredJson = nodeDatabase.get_nodeIDJson();
+			jp.clear();
+			jp.addString(restoredJson);
+			jp.parse();
+			return false;
+		}
 	}
 	return true;
 }
@@ -1138,7 +1194,15 @@ bool LoRA_Functions::changeType(int nodeNumber, int newType, bool persistNow) {
 	mod.finish();
 
 	if (persistNow) {
-		nodeDatabase.saveNodeIDJson(jp.getBuffer());
+		if (!nodeDatabase.saveNodeIDJson(jp.getBuffer())) {
+			Log.error("NodeDB save failed in changeType for node %d", nodeNumber);
+			// Reload from FRAM to restore jp state after mutation
+			const String restoredJson = nodeDatabase.get_nodeIDJson();
+			jp.clear();
+			jp.addString(restoredJson);
+			jp.parse();
+			return false;
+		}
 	}
 
 	return true;
@@ -1191,7 +1255,15 @@ bool LoRA_Functions::changeAlert(int nodeNumber, int newAlert, bool persistNow) 
 	mod.finish();
 
 	if (persistNow) {
-		nodeDatabase.saveNodeIDJson(jp.getBuffer());
+		if (!nodeDatabase.saveNodeIDJson(jp.getBuffer())) {
+			Log.error("NodeDB save failed in changeAlert for node %d", nodeNumber);
+			// Reload from FRAM to restore jp state after mutation
+			const String restoredJson = nodeDatabase.get_nodeIDJson();
+			jp.clear();
+			jp.addString(restoredJson);
+			jp.parse();
+			return false;
+		}
 	}
 
 	return true;
