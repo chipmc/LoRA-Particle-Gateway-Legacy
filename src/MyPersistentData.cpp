@@ -506,9 +506,9 @@ bool validateNodeDbJsonCandidate(const char *str, size_t len) {
 	}
 	// Reuse file-scope parser to avoid stack allocation
 	nodeDbValidator.clear();
-	const bool added = nodeDbValidator.addString(str);
+	const bool added = nodeDbValidator.addData(str, len);
 	if (!added) {
-		Log.error("NodeDB validation failed: addString rejected len=%u", (unsigned)len);
+		Log.error("NodeDB validation failed: addData rejected len=%u", (unsigned)len);
 		return false;
 	}
 	const bool parsed = nodeDbValidator.parse();
@@ -733,29 +733,37 @@ bool nodeIDData::set_nodeIDJson(const char *str) {
 	return setValueString(offsetof(NodeData, nodeIDJson), sizeof(NodeData::nodeIDJson), str);
 }
 
-bool nodeIDData::saveNodeIDJson(const char *str, bool force) {
-    if (!str) {
+bool nodeIDData::saveNodeIDJson(const char *json, size_t len, bool force) {
+    if (!json) {
         Log.error("NodeDB save rejected: null JSON pointer");
         return false;
     }
 
-    const size_t jsonLength = strlen(str);
-    if (jsonLength >= sizeof(NodeData::nodeIDJson)) {
-        Log.error("NodeDB save rejected: len=%u max=%u", (unsigned)jsonLength, (unsigned)(sizeof(NodeData::nodeIDJson) - 1));
+    if (len == 0) {
+        Log.error("NodeDB save rejected: zero length");
+        return false;
+    }
+
+    if (len >= sizeof(NodeData::nodeIDJson)) {
+        Log.error("NodeDB save rejected: len=%u max=%u", (unsigned)len, (unsigned)(sizeof(NodeData::nodeIDJson) - 1));
         return false;
     }
 
     // Defensive: validate JSON before writing to FRAM
-    if (!validateNodeDbJsonCandidate(str, jsonLength)) {
-        Log.error("NodeDB save rejected: JSON validation failed len=%u", (unsigned)jsonLength);
+    if (!validateNodeDbJsonCandidate(json, len)) {
+        Log.error("NodeDB save rejected: JSON validation failed len=%u", (unsigned)len);
         // Note: Global jp may be mutated. Callers should reload from FRAM if needed.
         return false;
     }
 
     const bool hadPendingPersist = hasPendingPersist();
-    if (!set_nodeIDJson(str)) {
-        Log.error("NodeDB save rejected: set_nodeIDJson failed len=%u", (unsigned)jsonLength);
-        return false;
+
+    // Copy the exact length into nodeIDJson and ensure null-termination
+    WITH_LOCK(*this) {
+        char *dest = nodeData.nodeIDJson;
+        memcpy(dest, json, len);
+        dest[len] = '\0';
+        updateHash();
     }
 
     if (!force) {
@@ -774,6 +782,15 @@ bool nodeIDData::saveNodeIDJson(const char *str, bool force) {
         Log.info("NodeDB atomic save complete");
     }
     return true;
+}
+
+bool nodeIDData::saveNodeIDJson(const char *str, bool force) {
+    if (!str) {
+        Log.error("NodeDB save rejected: null JSON pointer");
+        return false;
+    }
+    const size_t jsonLength = strlen(str);
+    return saveNodeIDJson(str, jsonLength, force);
 }
 
 bool nodeIDData::hasPendingPersist() const {
