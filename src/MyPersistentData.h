@@ -545,6 +545,7 @@ public:
 	size_t get_nodeIDJsonLength() const;
 	bool set_nodeIDJson(const char *str);
 	bool saveNodeIDJson(const char *str, bool force = true);
+	bool saveNodeIDJson(const char *json, size_t len, bool force);
 	bool hasPendingPersist() const;
 	uint32_t getDirtySinceMs() const;
 	bool persistIfDirty();

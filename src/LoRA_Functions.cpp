@@ -208,7 +208,7 @@ bool writeNodeFrequencyState(const JsonParserGeneratorRK::jsmntok_t *nodeObjectC
 	mod.insertOrUpdateKeyValue(nodeObjectContainer, "desiredReportFrequency", desiredReportFrequencyMinutes);
 	mod.insertOrUpdateKeyValue(nodeObjectContainer, "nodeAcknowledgedFrequency", nodeAcknowledgedFrequencyMinutes);
 	if (persistNow) {
-		if (!nodeDatabase.saveNodeIDJson(jp.getBuffer())) {
+		if (!nodeDatabase.saveNodeIDJson(jp.getBuffer(), jp.getOffset(), true)) {
 			Log.error("NodeDB save failed in writeNodeFrequencyState");
 			return false;
 		}
@@ -1058,7 +1058,7 @@ uint8_t LoRA_Functions::findNodeNumber(const char* deviceID, int radioID, bool p
 	mod.finish();
 
 	if (persistNow) {
-		if (!nodeDatabase.saveNodeIDJson(jp.getBuffer())) {
+		if (!nodeDatabase.saveNodeIDJson(jp.getBuffer(), jp.getOffset(), true)) {
 			Log.error("NodeDB save failed in findNodeNumber for node %d", index);
 			// Reload from FRAM to restore jp state after mutation
 			const String restoredJson = nodeDatabase.get_nodeIDJson();
@@ -1133,7 +1133,7 @@ bool LoRA_Functions::nodeUpdate(int nodeNumber, float successPercent, bool persi
 	mod.finish();
 
 	if (persistNow) {
-		if (!nodeDatabase.saveNodeIDJson(jp.getBuffer())) {
+		if (!nodeDatabase.saveNodeIDJson(jp.getBuffer(), jp.getOffset(), true)) {
 			Log.error("NodeDB save failed in nodeUpdate for node %d", nodeNumber);
 			// Reload from FRAM to restore jp state after mutation
 			const String restoredJson = nodeDatabase.get_nodeIDJson();
@@ -1194,7 +1194,7 @@ bool LoRA_Functions::changeType(int nodeNumber, int newType, bool persistNow) {
 	mod.finish();
 
 	if (persistNow) {
-		if (!nodeDatabase.saveNodeIDJson(jp.getBuffer())) {
+		if (!nodeDatabase.saveNodeIDJson(jp.getBuffer(), jp.getOffset(), true)) {
 			Log.error("NodeDB save failed in changeType for node %d", nodeNumber);
 			// Reload from FRAM to restore jp state after mutation
 			const String restoredJson = nodeDatabase.get_nodeIDJson();
@@ -1255,7 +1255,7 @@ bool LoRA_Functions::changeAlert(int nodeNumber, int newAlert, bool persistNow) 
 	mod.finish();
 
 	if (persistNow) {
-		if (!nodeDatabase.saveNodeIDJson(jp.getBuffer())) {
+		if (!nodeDatabase.saveNodeIDJson(jp.getBuffer(), jp.getOffset(), true)) {
 			Log.error("NodeDB save failed in changeAlert for node %d", nodeNumber);
 			// Reload from FRAM to restore jp state after mutation
 			const String restoredJson = nodeDatabase.get_nodeIDJson();
