@@ -81,12 +81,14 @@ struct PersistSnapshot {
 
 /**
  * Gateway scheduling hint for ACK bytes 6-7 and 10.
- * frequencyMinutes represents scheduleIntervalMinutes with dual semantics:
- *   - During open hours: reporting cadence / frequencyMinutes
- *   - During closed hours: minutes until next opening or next gateway window
+ * frequencyMinutes represents transient ACK scheduleIntervalMinutes with dual semantics:
+ *   - During open hours: minutes until next aligned boundary window (NOT the reporting cadence)
+ *   - During closed hours: minutes until next opening (relative sleep duration)
+ * This is the wire-protocol ACK interval, NOT the persistent NodeDB reporting cadence.
+ * Use gatewayDesiredReportFrequencyMinutes() for NodeDB persistence.
  */
 struct GatewayScheduleHint {
-	uint16_t frequencyMinutes;  // Legacy name: actually scheduleIntervalMinutes
+	uint16_t frequencyMinutes;  // Legacy name: transient ACK scheduleIntervalMinutes
 	bool openHours;
 };
 
@@ -826,15 +828,17 @@ bool LoRA_Functions::acknowledgeDataReportGateway() { 		// This is a response to
 	const GatewayBatteryBackoffState backoffState = gatewayBatteryBackoffState();
 	const GatewayScheduleHint scheduleHint = gatewayScheduleHint();
 	const time_t ackTime = gatewayAckTimestamp();
+	const uint16_t ackScheduleIntervalMinutes = scheduleHint.frequencyMinutes;  // Transient ACK interval for wire protocol
+	const uint16_t configuredReportFrequencyMinutes = gatewayDesiredReportFrequencyMinutes();  // Persistent NodeDB cadence (includes pending updates)
 	byte pendingAlert = 0;
 	bool clearPendingAlert = false;
 	float successPercent = 0.0f;
 
 	// buf[0] - buf[1] is magic number - processed above
 	encodeGatewayAckTimestamp(buf, ackTime);
-	// ACK bytes 6-7: scheduleIntervalMinutes (cadence during open hours, time-offset during closed)
-	buf[6] = highByte(scheduleHint.frequencyMinutes);
-	buf[7] = lowByte(scheduleHint.frequencyMinutes);	
+	// ACK bytes 6-7: transient scheduleIntervalMinutes (boundary interval during open hours, relative sleep during closed)
+	buf[6] = highByte(ackScheduleIntervalMinutes);
+	buf[7] = lowByte(ackScheduleIntervalMinutes);
 	// The next few bytes of the response will depend on whether the node is configured or not
 	if (current.get_nodeNumber() == 11) {			// This is a data report from an unconfigured node - need to tell it to rejoin
 		Log.info("Node %d is invalid, setting alert code to 1", current.get_nodeNumber());
@@ -881,14 +885,16 @@ bool LoRA_Functions::acknowledgeDataReportGateway() { 		// This is a response to
 			jp.getValueTokenByKey(jp.getOuterObject(), "nodes", nodesArrayContainer);
 			const JsonParserGeneratorRK::jsmntok_t *nodeObjectContainer = jp.getTokenByIndex(nodesArrayContainer, current.get_nodeNumber() - 1);
 			const NodeFrequencyState nodeFrequencyState = readNodeFrequencyState(nodeObjectContainer);
-			if (nodeFrequencyState.nodeAcknowledgedFrequencyMinutes != scheduleHint.frequencyMinutes) {
-				Log.info("FrequencyChange: node=%d old=%u new=%u reason=BATTERY_BACKOFF", current.get_nodeNumber(), nodeFrequencyState.nodeAcknowledgedFrequencyMinutes, scheduleHint.frequencyMinutes);
+			// Only log FrequencyChange when persistent configured cadence changes, not transient ACK interval
+			if (nodeFrequencyState.nodeAcknowledgedFrequencyMinutes != configuredReportFrequencyMinutes) {
+				Log.info("FrequencyChange: node=%d old=%u new=%u reason=BATTERY_BACKOFF", current.get_nodeNumber(), nodeFrequencyState.nodeAcknowledgedFrequencyMinutes, configuredReportFrequencyMinutes);
 			}
 			if (clearPendingAlert) {
 				LoRA_Functions::changeAlert(current.get_nodeNumber(), 0, false);
 			}
 			LoRA_Functions::instance().nodeUpdate(current.get_nodeNumber(), successPercent, false);
-			writeNodeFrequencyState(nodeObjectContainer, scheduleHint.frequencyMinutes, scheduleHint.frequencyMinutes, true);
+			// Persist configured cadence, not transient ACK schedule interval
+			writeNodeFrequencyState(nodeObjectContainer, configuredReportFrequencyMinutes, configuredReportFrequencyMinutes, true);
 			syncGatewayFrequencyWithBatteryBackoff(backoffState);
 			logPersistWindow("dataAckPost", millis() - persistStart, beforePersist);
 		}
@@ -939,6 +945,8 @@ bool LoRA_Functions::acknowledgeJoinRequestGateway() {
 	const GatewayBatteryBackoffState backoffState = gatewayBatteryBackoffState();
 	const GatewayScheduleHint scheduleHint = gatewayScheduleHint();
 	const time_t ackTime = gatewayAckTimestamp();
+	const uint16_t ackScheduleIntervalMinutes = scheduleHint.frequencyMinutes;  // Transient ACK interval for wire protocol
+	const uint16_t configuredReportFrequencyMinutes = gatewayDesiredReportFrequencyMinutes();  // Persistent NodeDB cadence (includes pending updates)
 	Log.info("Acknowledge Join Request");
 	// This is a response to a data message and a specific payload and message flag
 	// Send a reply back to the originator client
@@ -946,9 +954,9 @@ bool LoRA_Functions::acknowledgeJoinRequestGateway() {
 	buf[0] = highByte(sysStatus.get_magicNumber());					// Magic number - so you can trust me
 	buf[1] = lowByte(sysStatus.get_magicNumber());					// Magic number - so you can trust me
 	encodeGatewayAckTimestamp(buf, ackTime);
-	// ACK bytes 6-7: scheduleIntervalMinutes (cadence during open hours, time-offset during closed)
-	buf[6] = highByte(scheduleHint.frequencyMinutes);
-	buf[7] = lowByte(scheduleHint.frequencyMinutes);	
+	// ACK bytes 6-7: transient scheduleIntervalMinutes (boundary interval during open hours, relative sleep during closed)
+	buf[6] = highByte(ackScheduleIntervalMinutes);
+	buf[7] = lowByte(ackScheduleIntervalMinutes);
 	buf[8] = (current.get_nodeNumber() != 11) ?  0 : 1;				// Clear the alert code for the node unless the nodeNumber process failed
 	buf[9] = current.get_nodeNumber();								
 	buf[10] = current.get_sensorType();								// In a join request the node type overwrites the node database value
@@ -967,10 +975,12 @@ bool LoRA_Functions::acknowledgeJoinRequestGateway() {
 		jp.getValueTokenByKey(jp.getOuterObject(), "nodes", nodesArrayContainer);
 		const JsonParserGeneratorRK::jsmntok_t *nodeObjectContainer = jp.getTokenByIndex(nodesArrayContainer, current.get_nodeNumber() - 1);
 		const NodeFrequencyState nodeFrequencyState = readNodeFrequencyState(nodeObjectContainer);
-		if (nodeFrequencyState.nodeAcknowledgedFrequencyMinutes != scheduleHint.frequencyMinutes) {
-			Log.info("FrequencyChange: node=%d old=%u new=%u reason=BATTERY_BACKOFF", current.get_nodeNumber(), nodeFrequencyState.nodeAcknowledgedFrequencyMinutes, scheduleHint.frequencyMinutes);
+		// Only log FrequencyChange when persistent configured cadence changes, not transient ACK interval
+		if (nodeFrequencyState.nodeAcknowledgedFrequencyMinutes != configuredReportFrequencyMinutes) {
+			Log.info("FrequencyChange: node=%d old=%u new=%u reason=BATTERY_BACKOFF", current.get_nodeNumber(), nodeFrequencyState.nodeAcknowledgedFrequencyMinutes, configuredReportFrequencyMinutes);
 		}
-		if (!writeNodeFrequencyState(nodeObjectContainer, scheduleHint.frequencyMinutes, scheduleHint.frequencyMinutes, true)) {
+		// Persist configured cadence, not transient ACK schedule interval
+		if (!writeNodeFrequencyState(nodeObjectContainer, configuredReportFrequencyMinutes, configuredReportFrequencyMinutes, true)) {
 			Log.error("NodeDB frequency update failed in JOIN_ACK for node %d", current.get_nodeNumber());
 		}
 		syncGatewayFrequencyWithBatteryBackoff(backoffState);

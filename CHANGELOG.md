@@ -2,6 +2,28 @@
 
 ## v27.00 - 2026-06-16
 
+### ACK Protocol v1 NodeDB Contamination Fix (2026-06-22)
+**Problem:** Gateway v27 persisted transient ACK schedule intervals into NodeDB frequency fields during outage recovery, causing false FrequencyChange logs (60 → 17 → 12 → 60).
+
+**Root Cause:** `acknowledgeDataReportGateway()` and `acknowledgeJoinRequestGateway()` used `scheduleHint.frequencyMinutes` for both ACK bytes 6-7 (correct) and NodeDB persistence (incorrect).
+
+**Solution:** Separated two concepts:
+- `ackScheduleIntervalMinutes` = transient ACK interval for wire protocol (ACK bytes 6-7)
+- `configuredReportFrequencyMinutes` = persistent NodeDB cadence from `gatewayDesiredReportFrequencyMinutes()` (includes pending manual/cloud updates and battery-backoff cadence)
+
+**Impact:**
+- ACK v1 wire protocol preserved (no Node firmware changes required)
+- NodeDB frequency fields now stable across transient ACK interval changes
+- FrequencyChange logs only emit when actual configured cadence changes (including pending updates)
+- Unnecessary NodeDB saves avoided when only ACK interval varies
+- Pending manual/cloud frequency updates properly reflected in NodeDB persistence
+
+**Changed:** [src/LoRA_Functions.cpp](src/LoRA_Functions.cpp)
+- DATA_ACK and JOIN_ACK handlers now persist `configuredReportFrequencyMinutes` from `gatewayDesiredReportFrequencyMinutes()` instead of transient `ackScheduleIntervalMinutes`
+- Updated GatewayScheduleHint struct comment to clarify dual semantics and persistence guidance
+- Added inline comments distinguishing transient ACK interval from persistent cadence
+- Fixed trailing whitespace
+
 ### Protocol Clarification (ACK Protocol v1)
 - **ACK bytes 6-7 semantics:** Gateway sends scheduleIntervalMinutes with dual semantics controlled by openHours flag (byte 10).
 - **During open hours:** Gateway sends `minutesUntilNextGatewayWindow()` — the actual minutes until the next aligned boundary window, NOT the reporting cadence.
