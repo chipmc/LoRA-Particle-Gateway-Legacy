@@ -55,7 +55,7 @@
 
 // Support for Particle Products (changes coming in 4.x - https://docs.particle.io/cards/firmware/macros/product_id/)
 PRODUCT_VERSION(GATEWAY_PRODUCT_VERSION);								// Platform-specific gateway release number
-char currentPointRelease[6] = GATEWAY_RELEASE_STRING;
+char currentPointRelease[16] = GATEWAY_RELEASE_STRING;
 
 // Prototype functions
 void publishStateTransition(void);                  // Keeps track of state machine changes - for debugging
