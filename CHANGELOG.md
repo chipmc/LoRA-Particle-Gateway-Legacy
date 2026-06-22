@@ -2,27 +2,40 @@
 
 ## v27.00 - 2026-06-16
 
-### Protocol Clarification
-- Clarified Gateway/Node v26/v27 protocol semantics: ACK bytes 6-7 carry scheduleIntervalMinutes with dual semantics controlled by openHours flag (byte 10).
-- During open hours: scheduleIntervalMinutes = reporting cadence for boundary-aligned node scheduling.
-- During closed hours: scheduleIntervalMinutes = minutes until next opening for relative node sleep.
+### Protocol Clarification (ACK Protocol v1)
+- **ACK bytes 6-7 semantics:** Gateway sends scheduleIntervalMinutes with dual semantics controlled by openHours flag (byte 10).
+- **During open hours:** Gateway sends `minutesUntilNextGatewayWindow()` — the actual minutes until the next aligned boundary window, NOT the reporting cadence.
+- **During closed hours:** Gateway sends `minutesUntilNextOpening()` — minutes until next opening for relative node sleep.
+- **Legacy Node v26 interpretation:**
+  - During open hours: Node uses bytes 6-7 as a boundary interval (wall-clock alignment).
+  - During closed hours: Node uses bytes 6-7 as relative sleep duration.
+  - Known limitation: After outage recovery during open hours, Node may misinterpret minutesUntilNextGatewayWindow as a new cadence if the value differs from its stored frequency.
 - Updated protocol documentation to use scheduleIntervalMinutes terminology instead of ambiguous frequencyMinutes.
-- Preserved functional behavior: Gateway sends time offsets during closed hours, cadence during open hours.
 - Added clarifying comments to GatewayScheduleHint and NodeFrequencyState structs noting legacy field naming.
+
+**Known ACK Protocol v1 Limitations:**
+- ACK bytes 6-7 conflate two concepts: periodic reporting cadence vs one-time next-wake target.
+- Legacy Nodes may misinterpret minutesUntilNextGatewayWindow during open hours as a cadence change.
+- No version-gated protocol negotiation exists for safe protocol evolution.
+
+**Future Work (ACK Protocol v2):**
+- Separate report cadence (periodic) from next wake target (one-time).
+- Add protocol version negotiation for backward-compatible rollout.
+- Require coordinated Gateway/Node firmware updates with version gating.
 
 ### NodeDB Persistence Hardening
 - Enhanced JSON validator to verify NodeDB shape (root object with "nodes" array) in addition to syntax.
+- Validator uses file-scope static allocation (JsonParserStatic<1024,256>) to avoid stack allocation spikes.
 - Updated NodeDB parser sizing for 10-node support: 1024 bytes, 256 tokens (was 50 tokens).
 - Defined shared constants: NODEDB_JSON_BYTES=1024, NODEDB_JSON_TOKENS=256, NODEDB_MAX_NODES=10.
 - Matched validator token capacity to operational parser limits to avoid rejecting valid payloads.
 - Fixed mutation functions (findNodeNumber, nodeUpdate, changeType, changeAlert) to return failure when FRAM save fails.
-- Added writeNodeFrequencyState return value checks in DATA_ACK and JOIN_ACK paths with node-contextual logging.
+- Added writeNodeFrequencyState return value check in JOIN_ACK path with node-contextual logging.
 - Implemented jp state restoration from FRAM after save failure to maintain in-memory/persisted consistency.
 - Improved error visibility with concise diagnostics for invalid JSON loads (length + 60-char sanitized preview).
 - Enhanced saveNodeIDJson return path to detect flush failures via dirty-flag check.
 
 **Residual Risks:**
-- Validator allocates ~6KB stack (JsonParserStatic<1024,256>) during validation. P2 has sufficient stack but worth monitoring.
 - jp reload from FRAM after mutation is not atomic with the mutation operation.
 - ACK operations may partially succeed (e.g., nodeUpdate succeeds but frequency update fails; ACK sent anyway).
 - Non-persisted mutations may occur if force=false (deferred flush); global jp reflects changes not yet in FRAM.
