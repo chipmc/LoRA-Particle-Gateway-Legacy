@@ -533,7 +533,7 @@ void loop() {
 				}
 				clearParticleConnectGuard();
 				if (sysStatus.get_connectivityMode() == 1) state = LoRA_STATE;			// Go back to the LoRA State if we are in connected mode
-				else state = DISCONNECTING_STATE;	 									// Typically, we will disconnect and sleep to save power - publishes occur during the 90 seconds before disconnect
+				else state = DISCONNECTING_STATE;	 									// Typically, we will disconnect and sleep to save power - minimum cloud command window allows remote control + queued publish drain
 			}
 			else if (millis() - connectingTimeout > 600000L) {
 				#if HAL_PLATFORM_WIFI
@@ -554,17 +554,17 @@ void loop() {
 
 		} break;
 
-		case DISCONNECTING_STATE: {														// Waits 90 seconds then disconnects
-			static system_tick_t stayConnectedWindow = 0;
+	case DISCONNECTING_STATE: {														// Minimum cloud-connected window for remote command/configuration access and queued publish drain before sleep
+		static system_tick_t cloudCommandWindowStart = 0;
 			static system_tick_t disconnectHardTimeout = 0;
 			static system_tick_t lastQueueLog = 0;
 
 			if (state != oldState) {
-				publishStateTransition(); 
-				stayConnectedWindow = millis(); 
-				disconnectHardTimeout = millis();
-				lastQueueLog = 0;
-				Log.info("PublishQueue: DISCONNECTING_STATE entry - queued=%u canSleep=%s", (unsigned)PublishQueuePosix::instance().getNumEvents(), PublishQueuePosix::instance().getCanSleep() ? "yes" : "no");
+			publishStateTransition();
+			cloudCommandWindowStart = millis();
+			disconnectHardTimeout = millis();
+			lastQueueLog = 0;
+			Log.info("CommandWindow: active hold=%lu ms queued=%u canSleep=%s", (unsigned long)MIN_CLOUD_COMMAND_WINDOW_MS, (unsigned)PublishQueuePosix::instance().getNumEvents(), PublishQueuePosix::instance().getCanSleep() ? "yes" : "no");
 			}
 
 			// Periodic queue state logging while waiting (every 15 seconds, only if queued)
@@ -572,11 +572,12 @@ void loop() {
 				lastQueueLog = millis();
 				const size_t queuedEvents = PublishQueuePosix::instance().getNumEvents();
 				if (queuedEvents > 0) {
-					Log.info("PublishQueue: DISCONNECTING wait - queued=%u canSleep=%s elapsed=%lu ms", (unsigned)queuedEvents, PublishQueuePosix::instance().getCanSleep() ? "yes" : "no", (unsigned long)(millis() - stayConnectedWindow));
+					Log.info("CommandWindow: extending for queue drain - queued=%u canSleep=%s elapsed=%lu ms", (unsigned)queuedEvents, PublishQueuePosix::instance().getCanSleep() ? "yes" : "no", (unsigned long)(millis() - cloudCommandWindowStart));
 				}
 			}
 
-			if ((millis() - stayConnectedWindow > 90000UL) && PublishQueuePosix::instance().getCanSleep()) {	// Stay on-line for 90 seconds and until we are done clearing the queue
+			if ((millis() - cloudCommandWindowStart > MIN_CLOUD_COMMAND_WINDOW_MS) && PublishQueuePosix::instance().getCanSleep()) {	// Minimum cloud command window satisfied and queue drained
+Log.info("CommandWindow: minimum hold satisfied - transitioning to sleep");
 				if (sysStatus.get_connectivityMode() == 0) Particle_Functions::instance().disconnectFromParticle();
 				state = SLEEPING_STATE;
 			}
