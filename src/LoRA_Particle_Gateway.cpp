@@ -333,6 +333,7 @@ void setup()
 	System.on(out_of_memory, outOfMemoryHandler);   // Enabling an out of memory handler is a good safety tip. If we run out of memory a System.reset() is done.
 
 	PublishQueuePosix::instance().setup();          // Initialize PublishQueuePosixRK
+	Log.info("PublishQueue: setup() returned - queued=%u canSleep=%s", (unsigned)PublishQueuePosix::instance().getNumEvents(), PublishQueuePosix::instance().getCanSleep() ? "yes" : "no");
 
 	LoRA_Functions::instance().setup(true);			// Start the LoRA radio (true for Gateway and false for Node)
 	LoRA_Functions::instance().attachGatewayDio0DiagnosticInterrupt();
@@ -504,6 +505,7 @@ void loop() {
 #endif
 
 			if (isCloudConnected()) {											// Either we will connect or we will timeout - will try for 10 minutes 
+				Log.info("PublishQueue: cloud connected - queued=%u canSleep=%s", (unsigned)PublishQueuePosix::instance().getNumEvents(), PublishQueuePosix::instance().getCanSleep() ? "yes" : "no");
 				#if HAL_PLATFORM_WIFI
 				if (cloudConnectedMs == 0) {
 					cloudConnectedMs = millis();
@@ -531,7 +533,7 @@ void loop() {
 				}
 				clearParticleConnectGuard();
 				if (sysStatus.get_connectivityMode() == 1) state = LoRA_STATE;			// Go back to the LoRA State if we are in connected mode
-				else state = DISCONNECTING_STATE;	 									// Typically, we will disconnect and sleep to save power - publishes occur during the 90 seconds before disconnect
+				else state = DISCONNECTING_STATE;	 									// Typically, we will disconnect and sleep to save power - minimum cloud command window allows remote control + queued publish drain
 			}
 			else if (millis() - connectingTimeout > 600000L) {
 				#if HAL_PLATFORM_WIFI
@@ -552,17 +554,30 @@ void loop() {
 
 		} break;
 
-		case DISCONNECTING_STATE: {														// Waits 90 seconds then disconnects
-			static system_tick_t stayConnectedWindow = 0;
+	case DISCONNECTING_STATE: {														// Minimum cloud-connected window for remote command/configuration access and queued publish drain before sleep
+		static system_tick_t cloudCommandWindowStart = 0;
 			static system_tick_t disconnectHardTimeout = 0;
+			static system_tick_t lastQueueLog = 0;
 
 			if (state != oldState) {
-				publishStateTransition(); 
-				stayConnectedWindow = millis(); 
-				disconnectHardTimeout = millis();
+			publishStateTransition();
+			cloudCommandWindowStart = millis();
+			disconnectHardTimeout = millis();
+			lastQueueLog = 0;
+			Log.info("CommandWindow: active hold=%lu ms queued=%u canSleep=%s", (unsigned long)MIN_CLOUD_COMMAND_WINDOW_MS, (unsigned)PublishQueuePosix::instance().getNumEvents(), PublishQueuePosix::instance().getCanSleep() ? "yes" : "no");
 			}
 
-			if ((millis() - stayConnectedWindow > 90000UL) && PublishQueuePosix::instance().getCanSleep()) {	// Stay on-line for 90 seconds and until we are done clearing the queue
+			// Periodic queue state logging while waiting (every 15 seconds, only if queued)
+			if (lastQueueLog == 0 || (millis() - lastQueueLog) > 15000UL) {
+				lastQueueLog = millis();
+				const size_t queuedEvents = PublishQueuePosix::instance().getNumEvents();
+				if (queuedEvents > 0) {
+					Log.info("CommandWindow: extending for queue drain - queued=%u canSleep=%s elapsed=%lu ms", (unsigned)queuedEvents, PublishQueuePosix::instance().getCanSleep() ? "yes" : "no", (unsigned long)(millis() - cloudCommandWindowStart));
+				}
+			}
+
+			if ((millis() - cloudCommandWindowStart > MIN_CLOUD_COMMAND_WINDOW_MS) && PublishQueuePosix::instance().getCanSleep()) {	// Minimum cloud command window satisfied and queue drained
+Log.info("CommandWindow: minimum hold satisfied - transitioning to sleep");
 				if (sysStatus.get_connectivityMode() == 0) Particle_Functions::instance().disconnectFromParticle();
 				state = SLEEPING_STATE;
 			}
@@ -684,7 +699,8 @@ void publishWebhook(uint8_t nodeNumber) {
 			current.get_internalTempC(), current.get_resetCount(), current.get_alertCodeNode(), current.get_nodeNumber(),
 			nodeRssi, nodeSnr, current.get_hops(), current.get_messageCount(), percentSuccess,
 			endTimePeriod);
-		PublishQueuePosix::instance().publish("Ubidots-LoRA-Node-v1", data, PRIVATE | WITH_ACK);
+		bool publishResult = PublishQueuePosix::instance().publish("Ubidots-LoRA-Node-v1", data, PRIVATE | WITH_ACK);
+		Log.info("PublishQueue: node=%u publish=%s queued=%u canSleep=%s", nodeNumber, publishResult ? "ok" : "FAIL", (unsigned)PublishQueuePosix::instance().getNumEvents(), PublishQueuePosix::instance().getCanSleep() ? "yes" : "no");
 	}
 	else {																// Webhook for the gateway
 		takeMeasurements();												// Loads the current values for the Gateway
@@ -697,7 +713,8 @@ void publishWebhook(uint8_t nodeNumber) {
 			Particle.deviceID().c_str(), current.get_stateOfCharge(), gatewayBatteryContext(current.get_batteryState()),
 			current.get_internalTempC(), sysStatus.get_resetCount(), sysStatus.get_alertCodeGateway(),
 			sysStatus.get_messageCount(), sysStatus.get_lastConnectionDuration(), endTimePeriod);
-		PublishQueuePosix::instance().publish("Ubidots-LoRA-Gateway-v2", data, PRIVATE | WITH_ACK);
+		bool publishResult = PublishQueuePosix::instance().publish("Ubidots-LoRA-Gateway-v2", data, PRIVATE | WITH_ACK);
+		Log.info("PublishQueue: gateway publish=%s queued=%u canSleep=%s", publishResult ? "ok" : "FAIL", (unsigned)PublishQueuePosix::instance().getNumEvents(), PublishQueuePosix::instance().getCanSleep() ? "yes" : "no");
 	}
 	return;
 }
