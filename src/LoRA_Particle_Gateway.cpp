@@ -577,13 +577,18 @@ void loop() {
 			}
 
 			if ((millis() - cloudCommandWindowStart > MIN_CLOUD_COMMAND_WINDOW_MS) && PublishQueuePosix::instance().getCanSleep()) {	// Minimum cloud command window satisfied and queue drained
-Log.info("CommandWindow: minimum hold satisfied - transitioning to sleep");
+				const size_t queuedEvents = PublishQueuePosix::instance().getNumEvents();
+				if (queuedEvents == 0) {
+					Log.info("CommandWindow: complete; queue drained - transitioning to sleep queued=0 canSleep=yes");
+				} else {
+					Log.info("CommandWindow: complete; queue pending - transitioning to sleep queued=%u canSleep=yes", (unsigned)queuedEvents);
+				}
 				if (sysStatus.get_connectivityMode() == 0) Particle_Functions::instance().disconnectFromParticle();
 				state = SLEEPING_STATE;
 			}
 			else if ((millis() - disconnectHardTimeout) > DISCONNECTING_HARD_TIMEOUT_MS) {
 				const size_t queuedEvents = PublishQueuePosix::instance().getNumEvents();
-				Log.error("Disconnect timeout after %lu ms waiting on publish queue (canSleep=%s queued=%u) - forcing cloud shutdown", DISCONNECTING_HARD_TIMEOUT_MS, PublishQueuePosix::instance().getCanSleep() ? "yes" : "no", (unsigned) queuedEvents);
+				Log.error("CommandWindow: hard timeout - transitioning to sleep queued=%u canSleep=%s", (unsigned)queuedEvents, PublishQueuePosix::instance().getCanSleep() ? "yes" : "no");
 				if (Particle_Functions::instance().disconnectFromParticle()) {
 					state = SLEEPING_STATE;
 				}
