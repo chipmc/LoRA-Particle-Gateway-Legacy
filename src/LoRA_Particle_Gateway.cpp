@@ -425,8 +425,30 @@ void loop() {
 				conv.withCurrentTime().convert();								// Get the time and convert to Local
 				current.set_openHours(isParkOpenNow());
 
-				if (sysStatus.get_connectivityMode() == 0) connectionWindowSeconds = gatewayBatteryBackoffState().listenWindowSeconds;
-				else connectionWindowSeconds = STAY_CONNECTED * 60U;
+				const GatewayBatteryBackoffState backoffState = gatewayBatteryBackoffState();
+				const uint16_t baseWindow = backoffState.listenWindowSeconds;
+				
+				// Recovery listen extension: extend window if stale nodes exist AND not in battery backoff
+				int staleNodeCount = 0;
+				int newestStaleAge = 0;
+				if (LoRA_Functions::instance().hasStaleNodeConnections(&staleNodeCount, &newestStaleAge) && backoffState.level == 0) {
+					connectionWindowSeconds = RECOVERY_LISTEN_WINDOW_SECONDS;
+					Log.info("RecoveryListen: staleNodes=%d base=%u recovery=%d selected=%u level=%u", staleNodeCount, baseWindow, RECOVERY_LISTEN_WINDOW_SECONDS, connectionWindowSeconds, backoffState.level);
+				}
+				else {
+					connectionWindowSeconds = baseWindow;
+					if (staleNodeCount > 0) {
+						Log.info("RecoveryListen: inactive staleNodes=%d base=%u selected=%u level=%u reason=BATTERY_BACKOFF", staleNodeCount, baseWindow, connectionWindowSeconds, backoffState.level);
+					}
+					else {
+						Log.info("RecoveryListen: inactive staleNodes=0 base=%u selected=%u level=%u", baseWindow, connectionWindowSeconds, backoffState.level);
+					}
+				}
+				
+				// Override for stay-connected mode
+				if (sysStatus.get_connectivityMode() == 1) {
+					connectionWindowSeconds = STAY_CONNECTED * 60U;
+				}
 
 				LoRA_Functions::instance().logGatewayStateEntry();
 

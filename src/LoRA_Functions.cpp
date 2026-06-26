@@ -894,7 +894,9 @@ bool LoRA_Functions::acknowledgeDataReportGateway() { 		// This is a response to
 			}
 			LoRA_Functions::instance().nodeUpdate(current.get_nodeNumber(), successPercent, false);
 			// Persist configured cadence, not transient ACK schedule interval
-			writeNodeFrequencyState(nodeObjectContainer, configuredReportFrequencyMinutes, configuredReportFrequencyMinutes, true);
+			if (!writeNodeFrequencyState(nodeObjectContainer, configuredReportFrequencyMinutes, configuredReportFrequencyMinutes, true)) {
+				Log.warn("NodeDB: frequency write failed node=%d desired=%u ack=%u", current.get_nodeNumber(), configuredReportFrequencyMinutes, configuredReportFrequencyMinutes);
+			}
 			syncGatewayFrequencyWithBatteryBackoff(backoffState);
 			logPersistWindow("dataAckPost", millis() - persistStart, beforePersist);
 		}
@@ -1321,7 +1323,6 @@ void LoRA_Functions::printNodeData(bool publish) {
 bool LoRA_Functions::nodeConnectionsHealthy() {								// Connections are healthy if at least one node connected in last two periods
 // Resets the LoRA Radio if not healthy
 	
-	int lastConnect;
 	time_t secondsPerPeriod = sysStatus.get_frequencyMinutes() * 60;
 	bool health = true;
 
@@ -1333,9 +1334,11 @@ bool LoRA_Functions::nodeConnectionsHealthy() {								// Connections are health
 		nodeObjectContainer = jp.getTokenByIndex(nodesArrayContainer, i);
 		if(nodeObjectContainer == NULL) break;								// Ran out of entries 
 
+		int lastConnect = 0;
 		jp.getValueByKey(nodeObjectContainer, "last", lastConnect);
 
-		if ((Time.now() - lastConnect) > secondsPerPeriod) {				// If any of the nodes fail to connect - will extend loRA dwell time
+		// Missing, invalid, or non-positive timestamps treated as stale/unhealthy
+		if (lastConnect <= 0 || (Time.now() - lastConnect) > secondsPerPeriod) {	// If any of the nodes fail to connect - will extend loRA dwell time
 			health = false;
 			break;															// Don't need to keep checking
 		}
@@ -1344,6 +1347,45 @@ bool LoRA_Functions::nodeConnectionsHealthy() {								// Connections are health
 	Log.info("Node connections are %s ", (health) ? "healthy":"unhealthy");
 	if(!health) LoRA_Functions::initializeRadio();
 	return health;
+}
+
+bool LoRA_Functions::hasStaleNodeConnections(int *staleCount, int *newestAge) {
+	// Pure helper - no radio reinit, no NodeDB mutation, no alert mutation, no state transition
+	
+	const time_t staleThresholdSeconds = sysStatus.get_frequencyMinutes() * 60;
+	const time_t now = Time.now();
+	int localStaleCount = 0;
+	int localNewestAge = -1;
+	
+	const JsonParserGeneratorRK::jsmntok_t *nodesArrayContainer;
+	jp.getValueTokenByKey(jp.getOuterObject(), "nodes", nodesArrayContainer);
+	
+	for (int i = 0; i < 10; i++) {
+		const JsonParserGeneratorRK::jsmntok_t *nodeObjectContainer = jp.getTokenByIndex(nodesArrayContainer, i);
+		if (nodeObjectContainer == NULL) break;
+		
+		int lastConnect = 0;
+		jp.getValueByKey(nodeObjectContainer, "last", lastConnect);
+		
+		// Missing, invalid, or non-positive timestamps treated as stale
+		if (lastConnect <= 0) {
+			localStaleCount++;
+			continue;
+		}
+		
+		const int age = (int)(now - lastConnect);
+		if (age > staleThresholdSeconds) {
+			localStaleCount++;
+			if (localNewestAge < 0 || age < localNewestAge) {
+				localNewestAge = age;
+			}
+		}
+	}
+	
+	if (staleCount) *staleCount = localStaleCount;
+	if (newestAge) *newestAge = localNewestAge;
+	
+	return localStaleCount > 0;
 }
 
 int LoRA_Functions::stringCheckSum(String str){												// This function is made for the Particle DeviceID

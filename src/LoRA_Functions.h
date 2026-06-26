@@ -296,6 +296,19 @@ public:
     bool nodeConnectionsHealthy();
 
     /**
+     * @brief Checks if any nodes have stale connections (no contact for longer than reporting cadence)
+     * 
+     * @param staleCount Optional pointer to receive the number of stale nodes
+     * @param newestAge Optional pointer to receive the age of the newest stale node in seconds
+     * @returns true if at least one stale node exists
+     * 
+     * @details Pure helper function - does not mutate NodeDB, alerts, or trigger radio reinitialization.
+     *          Missing, invalid, or non-positive timestamps are treated as stale.
+     *          Uses sysStatus.get_frequencyMinutes() * 60 as the stale threshold.
+     */
+    bool hasStaleNodeConnections(int *staleCount = nullptr, int *newestAge = nullptr);
+
+    /**
      * @brief computes a two digit checksum based on the Particle deviceID
      * 
      * @param str - a 24 character hex number string
