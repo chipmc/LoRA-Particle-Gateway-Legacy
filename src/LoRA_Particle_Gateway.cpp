@@ -38,7 +38,7 @@
 // v21.00 - Gateway production hardening release with FRAM repair/verification, normalized logging, battery telemetry, safe local config handling, and boot reset diagnostics
 // v23.00 - Release finalization with NodeDB save coalescing, ACK-path persistence reduction, compact persistence instrumentation, and RF9X modem-config compatibility build fix
 // v25.00 - Power back-off for low battery conditions, signed LoRa decode hardening, and persistence log severity tuning
-// v27.00 - NodeDB persistence hardening with enhanced JSON validation, mutation failure handling, ACK Protocol v1 clarification, and static validator allocation
+// v27.00 - Production hardening release: NodeDB persistence hardening, ACK Protocol v1 contamination fix, enhanced JSON validation, mutation failure handling, WiFi outage resilience
 
 // Particle Libraries
 #include "PublishQueuePosixRK.h"			        // https://github.com/rickkas7/PublishQueuePosixRK

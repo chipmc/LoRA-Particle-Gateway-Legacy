@@ -1,6 +1,24 @@
 # Changelog
 
-## v27.00 - 2026-06-16
+## v27.00 - 2026-06-27
+
+### Production Hardening Summary
+
+Version 27 production hardening release validated and ready for deployment.
+
+**Validated Behaviors:**
+- ✅ PublishQueue drain behavior under WiFi outage scenarios
+- ✅ Command window behavior and timing
+- ✅ RecoveryListen hardening and retry logic
+- ✅ Timestamp-safe node health tracking across time sync events
+- ✅ WiFi outage queue accumulation and drain cycles
+- ✅ Clean compilation for Boron and Photon 2/P2 platforms
+
+**Key Improvements:**
+- Enhanced NodeDB persistence hardening with comprehensive JSON validation
+- ACK Protocol v1 contamination fix prevents transient schedule intervals from corrupting NodeDB frequency fields
+- Improved mutation failure handling with FRAM save verification
+- Separated transient ACK scheduling from persistent node configuration
 
 ### ACK Protocol v1 NodeDB Contamination Fix (2026-06-22)
 **Problem:** Gateway v27 persisted transient ACK schedule intervals into NodeDB frequency fields during outage recovery, causing false FrequencyChange logs (60 → 17 → 12 → 60).

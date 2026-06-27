@@ -2,6 +2,12 @@
 
 This is an implementation of Jeff Skarda's mesh extension to the Radiohead RF-95 Library.
 
+**Current Release:** v27.00 (Production Hardening)
+- Enhanced NodeDB persistence with comprehensive validation
+- ACK Protocol v1 contamination fix for stable frequency management
+- Validated WiFi outage resilience and queue management
+- Dual-platform support: Boron and Photon 2/P2
+
 ## Local config
 
 This repo commits `src/config.h` as the shared operational configuration surface.
